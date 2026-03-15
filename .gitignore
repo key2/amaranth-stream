@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.vcd
+*.egg-info/
+.venv/
+dist/
+build/
+pdm.lock
+.pdm-python
+test_*.txt
