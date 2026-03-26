@@ -1,7 +1,8 @@
 """Monitoring and debug components for amaranth-stream.
 
-Provides :class:`StreamMonitor` for performance counters and
-:class:`StreamChecker` for protocol assertion checking.
+Provides :class:`StreamMonitor` for performance counters,
+:class:`StreamChecker` for protocol assertion checking, and
+:class:`StreamProtocolChecker` for protocol violation detection with error codes.
 """
 
 from amaranth import *
@@ -11,7 +12,7 @@ from amaranth.lib.wiring import In, Out
 
 from ._base import Signature as StreamSignature
 
-__all__ = ["StreamMonitor", "StreamChecker"]
+__all__ = ["StreamMonitor", "StreamChecker", "StreamProtocolChecker"]
 
 
 class StreamMonitor(wiring.Component):
@@ -208,5 +209,146 @@ class StreamChecker(wiring.Component):
                     m.d.sync += error_flag.eq(1)
 
         m.d.comb += self.error.eq(error_flag)
+
+        return m
+
+
+class StreamProtocolChecker(wiring.Component):
+    """Protocol checker with error codes for stream protocol violations.
+
+    Passively monitors a stream and reports protocol violations with
+    specific error codes.  The checker does not drive ``ready`` or
+    ``valid`` — it is purely an observer.
+
+    Protocol checks
+    ---------------
+    1. **first without preceding last** — ``first`` must not be asserted
+       unless the previous transfer had ``last=1`` or this is the very
+       first transfer.  (Only checked when the signature has first/last.)
+    2. **valid deasserted without handshake** — once ``valid`` is asserted,
+       it must remain asserted until a transfer (``valid & ready``) occurs.
+    3. **payload changed without handshake** — while ``valid=1`` and
+       ``ready=0``, the payload must remain stable.
+
+    Error codes
+    -----------
+    0 = no error,
+    1 = first without preceding last,
+    2 = valid deasserted without handshake,
+    3 = payload changed without handshake.
+
+    Parameters
+    ----------
+    signature : :class:`~amaranth_stream.Signature`
+        Stream signature to monitor.
+    domain : :class:`str`
+        Clock domain (default ``"sync"``).
+
+    Ports
+    -----
+    stream : In(signature)
+        Stream to monitor (passive — does NOT drive ready).
+    error : Out(1)
+        Asserted when a protocol violation is detected this cycle.
+    error_code : Out(2)
+        Indicates which violation occurred (0–3).
+    """
+
+    def __init__(self, signature, domain="sync"):
+        if not isinstance(signature, StreamSignature):
+            raise TypeError(
+                f"Expected amaranth_stream.Signature, got {type(signature).__name__}")
+        self._stream_sig = signature
+        self._domain = domain
+        super().__init__({
+            "stream": In(signature),
+            "error": Out(1),
+            "error_code": Out(2),
+        })
+
+    def elaborate(self, platform):
+        m = Module()
+
+        sig = self._stream_sig
+        domain = self._domain
+
+        # Previous-cycle registers
+        prev_valid = Signal(name="prev_valid")
+        prev_ready = Signal(name="prev_ready")
+        prev_payload = Signal(Shape.cast(sig.payload_shape).width, name="prev_payload")
+
+        # Register previous-cycle values
+        m.d[domain] += [
+            prev_valid.eq(self.stream.valid),
+            prev_ready.eq(self.stream.ready),
+            prev_payload.eq(self.stream.payload),
+        ]
+
+        # For first/last checking, we need additional registers
+        if sig.has_first_last:
+            prev_first = Signal(name="prev_first")
+            # Tracks whether the last completed transfer had last=1.
+            # Initialised to 1 so the very first transfer may assert first.
+            last_xfer_had_last = Signal(name="last_xfer_had_last", init=1)
+            # Delayed copy: holds last_xfer_had_last from the previous cycle
+            # (before the current transfer updated it).
+            prev_xfer_had_last = Signal(name="prev_xfer_had_last", init=1)
+
+            m.d[domain] += [
+                prev_first.eq(self.stream.first),
+                prev_xfer_had_last.eq(last_xfer_had_last),
+            ]
+            # Update last_xfer_had_last on every completed transfer
+            with m.If(self.stream.valid & self.stream.ready):
+                m.d[domain] += last_xfer_had_last.eq(self.stream.last)
+
+        # Error detection (active for one cycle per violation)
+        error = Signal(name="error_out")
+        error_code = Signal(2, name="error_code_out")
+
+        # Previous cycle had valid=1 but no transfer (valid & ~ready)
+        prev_stall = Signal(name="prev_stall")
+        m.d.comb += prev_stall.eq(prev_valid & ~prev_ready)
+
+        # Previous cycle had a completed transfer
+        prev_transfer = Signal(name="prev_transfer")
+        m.d.comb += prev_transfer.eq(prev_valid & prev_ready)
+
+        # Build the condition for check 1 (first without last).
+        # When has_first_last is False, first_err is always 0 (never fires).
+        if sig.has_first_last:
+            # If the previous cycle was a transfer with first=1, the
+            # transfer before it must have had last=1.
+            first_err = Signal(name="first_err")
+            m.d.comb += first_err.eq(
+                prev_transfer & prev_first & ~prev_xfer_had_last)
+        else:
+            first_err = Const(0)
+
+        # Priority-encoded error checks (only one error reported per cycle)
+        with m.If(prev_stall & ~self.stream.valid):
+            # Check 2: valid deasserted without handshake
+            m.d.comb += [
+                error.eq(1),
+                error_code.eq(2),
+            ]
+        with m.Elif(prev_stall & (self.stream.payload != prev_payload)):
+            # Check 3: payload changed without handshake
+            m.d.comb += [
+                error.eq(1),
+                error_code.eq(3),
+            ]
+        with m.Elif(first_err):
+            # Check 1: first without preceding last
+            m.d.comb += [
+                error.eq(1),
+                error_code.eq(1),
+            ]
+
+        # Drive output ports
+        m.d.comb += [
+            self.error.eq(error),
+            self.error_code.eq(error_code),
+        ]
 
         return m

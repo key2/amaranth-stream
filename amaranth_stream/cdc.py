@@ -1,7 +1,7 @@
 """Clock-domain crossing component for amaranth-stream.
 
 Provides :class:`StreamCDC` which automatically selects between a simple
-:class:`Buffer` (same domain) and a :class:`StreamAsyncFIFO` (different
+:class:`PipeValid` (same domain) and a :class:`StreamAsyncFIFO` (different
 domains).
 """
 
@@ -10,7 +10,7 @@ from amaranth.lib import wiring
 from amaranth.lib.wiring import In, Out, connect
 
 from ._base import Signature as StreamSignature
-from .buffer import Buffer
+from .buffer import PipeValid
 from .fifo import StreamAsyncFIFO
 
 __all__ = ["StreamCDC"]
@@ -19,9 +19,10 @@ __all__ = ["StreamCDC"]
 class StreamCDC(wiring.Component):
     """Automatic clock-domain crossing for streams.
 
-    When ``w_domain == r_domain``, instantiates a :class:`Buffer` (simple
-    pipeline register). When the domains differ, instantiates a
-    :class:`StreamAsyncFIFO` for safe cross-domain transfer.
+    When ``w_domain == r_domain``, instantiates a :class:`PipeValid`
+    (forward-registered pipeline stage, 1-cycle latency). When the domains
+    differ, instantiates a :class:`StreamAsyncFIFO` for safe cross-domain
+    transfer.
 
     Parameters
     ----------
@@ -59,11 +60,11 @@ class StreamCDC(wiring.Component):
         m = Module()
 
         if self._w_domain == self._r_domain:
-            # Same domain: use a simple Buffer
-            buf = Buffer(self._stream_sig)
-            m.submodules.buf = buf
-            connect(m, wiring.flipped(self.i_stream), buf.i_stream)
-            connect(m, buf.o_stream, wiring.flipped(self.o_stream))
+            # Same domain: use PipeValid (1-cycle latency)
+            pv = PipeValid(self._stream_sig)
+            m.submodules.pv = pv
+            connect(m, wiring.flipped(self.i_stream), pv.i_stream)
+            connect(m, pv.o_stream, wiring.flipped(self.o_stream))
         else:
             # Different domains: use StreamAsyncFIFO
             fifo = StreamAsyncFIFO(

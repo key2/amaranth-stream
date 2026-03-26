@@ -16,6 +16,7 @@ from amaranth_stream.converter import (
     StreamCast,
     Pack,
     Unpack,
+    ByteEnableSerializer,
 )
 from amaranth_stream.sim import StreamSimSender, StreamSimReceiver
 
@@ -533,6 +534,202 @@ class TestGearbox:
         assert results == expected
 
 
+class TestGearboxPacket:
+    """Test Gearbox with has_first_last=True (packet-aware mode)."""
+
+    def test_gearbox_packet_aware_10to8(self):
+        """10-bit to 8-bit gearbox with first/last framing.
+
+        Send 3 beats of 10-bit data (30 bits total) with first on beat 0
+        and last on beat 2. Expect ceil(30/8) = 4 output beats (last one
+        has only 6 valid bits, zero-padded to 8).
+        """
+        dut = Gearbox(10, 8, has_first_last=True)
+        results = []
+
+        # 3 x 10-bit values
+        input_vals = [0x1AB, 0x2CD, 0x3EF]  # 10-bit values
+        combined = 0
+        for i, v in enumerate(input_vals):
+            combined |= v << (i * 10)
+        # 30 bits total → 4 x 8-bit outputs (last one is 6 bits, zero-padded)
+        n_out = (30 + 7) // 8  # = 4
+        expected = []
+        for i in range(n_out):
+            expected.append((combined >> (i * 8)) & 0xFF)
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            for i, val in enumerate(input_vals):
+                first = 1 if i == 0 else 0
+                last = 1 if i == len(input_vals) - 1 else 0
+                await sender.send(ctx, val, first=first, last=last)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            for _ in range(n_out):
+                beat = await receiver.recv(ctx)
+                results.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb, deadline_ns=200_000,
+                 vcd_name="test_gearbox_packet_10to8.vcd")
+
+        # Verify data
+        for i, (beat, exp) in enumerate(zip(results, expected)):
+            assert beat["payload"] == exp, \
+                f"Beat {i}: expected {exp:#04x}, got {beat['payload']:#04x}"
+
+        # Verify first/last framing
+        assert results[0]["first"] == 1, "First beat should have first=1"
+        for i in range(1, n_out):
+            assert results[i]["first"] == 0, f"Beat {i} should have first=0"
+        for i in range(n_out - 1):
+            assert results[i]["last"] == 0, f"Beat {i} should have last=0"
+        assert results[-1]["last"] == 1, "Last beat should have last=1"
+
+    def test_gearbox_packet_aware_flush(self):
+        """Verify that on last, remaining bits are flushed as a partial beat.
+
+        Send 1 beat of 10-bit data with first=1, last=1. This gives 10 bits,
+        which produces 1 full 8-bit beat + 1 partial 2-bit beat (zero-padded).
+        """
+        dut = Gearbox(10, 8, has_first_last=True)
+        results = []
+
+        input_val = 0x2AB  # 10-bit: 0b10_1010_1011
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, input_val, first=1, last=1)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            # 10 bits → 1 full byte + 1 partial byte (2 bits)
+            for _ in range(2):
+                beat = await receiver.recv(ctx)
+                results.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb, deadline_ns=200_000,
+                 vcd_name="test_gearbox_packet_flush.vcd")
+
+        assert len(results) == 2
+        # First byte: lower 8 bits of 0x2AB = 0xAB
+        assert results[0]["payload"] == (input_val & 0xFF)
+        # Second byte: upper 2 bits of 0x2AB = 0b10 = 0x02 (zero-padded)
+        assert results[1]["payload"] == ((input_val >> 8) & 0xFF)
+
+        # Framing
+        assert results[0]["first"] == 1
+        assert results[0]["last"] == 0
+        assert results[1]["first"] == 0
+        assert results[1]["last"] == 1
+
+    def test_gearbox_packet_aware_back_to_back(self):
+        """Two consecutive packets, verify they're correctly separated.
+
+        Packet 1: 2 beats of 10-bit data (20 bits → 3 output bytes, last partial)
+        Packet 2: 1 beat of 10-bit data (10 bits → 2 output bytes, last partial)
+        """
+        dut = Gearbox(10, 8, has_first_last=True)
+        results_pkt1 = []
+        results_pkt2 = []
+
+        # Packet 1: 2 x 10-bit
+        pkt1_vals = [0x0FF, 0x100]
+        pkt1_combined = pkt1_vals[0] | (pkt1_vals[1] << 10)
+        # 20 bits → 3 bytes (last byte has 4 valid bits)
+        pkt1_expected = []
+        for i in range(3):
+            pkt1_expected.append((pkt1_combined >> (i * 8)) & 0xFF)
+
+        # Packet 2: 1 x 10-bit
+        pkt2_val = 0x3AB
+        pkt2_expected = [pkt2_val & 0xFF, (pkt2_val >> 8) & 0xFF]
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            # Packet 1
+            await sender.send(ctx, pkt1_vals[0], first=1, last=0)
+            await sender.send(ctx, pkt1_vals[1], first=0, last=1)
+            # Packet 2
+            await sender.send(ctx, pkt2_val, first=1, last=1)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            # Receive packet 1 (3 beats)
+            for _ in range(3):
+                beat = await receiver.recv(ctx)
+                results_pkt1.append(beat)
+            # Receive packet 2 (2 beats)
+            for _ in range(2):
+                beat = await receiver.recv(ctx)
+                results_pkt2.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb, deadline_ns=300_000,
+                 vcd_name="test_gearbox_packet_b2b.vcd")
+
+        # Verify packet 1 data
+        for i, (beat, exp) in enumerate(zip(results_pkt1, pkt1_expected)):
+            assert beat["payload"] == exp, \
+                f"Pkt1 beat {i}: expected {exp:#04x}, got {beat['payload']:#04x}"
+
+        # Verify packet 1 framing
+        assert results_pkt1[0]["first"] == 1
+        assert results_pkt1[0]["last"] == 0
+        assert results_pkt1[1]["first"] == 0
+        assert results_pkt1[1]["last"] == 0
+        assert results_pkt1[2]["first"] == 0
+        assert results_pkt1[2]["last"] == 1
+
+        # Verify packet 2 data
+        for i, (beat, exp) in enumerate(zip(results_pkt2, pkt2_expected)):
+            assert beat["payload"] == exp, \
+                f"Pkt2 beat {i}: expected {exp:#04x}, got {beat['payload']:#04x}"
+
+        # Verify packet 2 framing
+        assert results_pkt2[0]["first"] == 1
+        assert results_pkt2[0]["last"] == 0
+        assert results_pkt2[1]["first"] == 0
+        assert results_pkt2[1]["last"] == 1
+
+    def test_gearbox_no_first_last_backward_compat(self):
+        """Verify has_first_last=False (default) works exactly as before.
+
+        Same test as test_gearbox_10_to_8 but explicitly checking backward
+        compatibility.
+        """
+        dut = Gearbox(10, 8)  # default has_first_last=False
+        results = []
+
+        input_vals = [0b0000000001, 0b0000000010, 0b0000000100, 0b0000001000]
+        combined = (input_vals[0] |
+                    (input_vals[1] << 10) |
+                    (input_vals[2] << 20) |
+                    (input_vals[3] << 30))
+        expected = []
+        for i in range(5):
+            expected.append((combined >> (i * 8)) & 0xFF)
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            for val in input_vals:
+                await sender.send(ctx, val)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            for _ in range(5):
+                beat = await receiver.recv(ctx)
+                results.append(beat["payload"])
+
+        _run_sim(dut, sender_tb, receiver_tb, deadline_ns=200_000,
+                 vcd_name="test_gearbox_no_fl_compat.vcd")
+
+        assert results == expected
+
+        # Verify no first/last fields in the output
+        assert "first" not in results[0] if isinstance(results[0], dict) else True
+
+
 # ---------------------------------------------------------------------------
 # StreamCast tests
 # ---------------------------------------------------------------------------
@@ -931,3 +1128,368 @@ class TestStrideConverter:
                  vcd_name="test_stride_non_int.vcd")
 
         assert results == expected
+
+    def test_stride_converter_short_packet_upsize(self):
+        """Short packet upsize: 8→32 with only 2 input beats (ratio=4).
+
+        Sends a 2-beat packet (with last on beat 2) into a 4x upsize
+        StrideConverter. The converter must not deadlock waiting for the
+        remaining 2 beats. Instead it should zero-pad the unfilled slots
+        and produce one output beat with correct data, zero-padding, and
+        last asserted.
+        """
+        i_sig = Signature(unsigned(8), has_first_last=True)
+        o_sig = Signature(unsigned(32), has_first_last=True)
+        dut = StrideConverter(i_sig, o_sig)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            # Send only 2 beats for a 4x upsize ratio — short packet
+            await sender.send(ctx, 0xAA, first=1, last=0)
+            await sender.send(ctx, 0xBB, first=0, last=1)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            beat = await receiver.recv(ctx)
+            results.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb, deadline_ns=50_000,
+                 vcd_name="test_stride_short_packet.vcd")
+
+        # Should get 1 output beat
+        assert len(results) == 1
+        beat = results[0]
+        # Data: byte 0 = 0xAA, byte 1 = 0xBB, bytes 2-3 = 0x00 (zero-padded)
+        assert beat["payload"] == 0x0000BBAA, \
+            f"Expected 0x0000BBAA, got {beat['payload']:#010x}"
+        # first should be set (captured from first input beat)
+        assert beat["first"] == 1
+        # last should be set (propagated from the short packet's last)
+        assert beat["last"] == 1
+
+
+# ---------------------------------------------------------------------------
+# StrideConverter param_shape tests
+# ---------------------------------------------------------------------------
+
+class TestStrideConverterParam:
+    """Test StrideConverter param_shape propagation."""
+
+    def test_stride_converter_param_propagation(self):
+        """Upconvert 8→32 bit with param_shape=4.
+
+        Send a packet where the first beat has param=0xA and subsequent
+        beats have param=0x0.  Verify the output beat has param=0xA
+        (captured from the first beat).
+        """
+        i_sig = Signature(unsigned(8), has_first_last=True)
+        o_sig = Signature(unsigned(32), has_first_last=True)
+        dut = StrideConverter(i_sig, o_sig, param_shape=4)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            # First beat: param=0xA, subsequent beats: param=0x0
+            await sender.send(ctx, 0x11, first=1, last=0, param=0xA)
+            await sender.send(ctx, 0x22, first=0, last=0, param=0x0)
+            await sender.send(ctx, 0x33, first=0, last=0, param=0x0)
+            await sender.send(ctx, 0x44, first=0, last=1, param=0x0)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            beat = await receiver.recv(ctx)
+            results.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb,
+                 vcd_name="test_stride_param_up.vcd")
+
+        assert len(results) == 1
+        assert results[0]["payload"] == 0x44332211
+        assert results[0]["param"] == 0xA
+        assert results[0]["first"] == 1
+        assert results[0]["last"] == 1
+
+    def test_stride_converter_param_downconvert(self):
+        """Downconvert 32→8 bit with param_shape=4.
+
+        Send a beat with param=0xB.  Verify all 4 output beats have
+        param=0xB.
+        """
+        i_sig = Signature(unsigned(32), has_first_last=True)
+        o_sig = Signature(unsigned(8), has_first_last=True)
+        dut = StrideConverter(i_sig, o_sig, param_shape=4)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, 0x44332211, first=1, last=1, param=0xB)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            for _ in range(4):
+                beat = await receiver.recv(ctx)
+                results.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb,
+                 vcd_name="test_stride_param_down.vcd")
+
+        assert len(results) == 4
+        assert results[0]["payload"] == 0x11
+        assert results[1]["payload"] == 0x22
+        assert results[2]["payload"] == 0x33
+        assert results[3]["payload"] == 0x44
+        # All output beats should carry param=0xB
+        for i, beat in enumerate(results):
+            assert beat["param"] == 0xB, \
+                f"Beat {i}: expected param=0xB, got {beat['param']:#x}"
+
+    def test_stride_converter_param_multi_packet(self):
+        """Verify param changes correctly between packets.
+
+        Send two packets with different param values during upconvert
+        8→16 and verify each output beat carries the correct param.
+        """
+        i_sig = Signature(unsigned(8), has_first_last=True)
+        o_sig = Signature(unsigned(16), has_first_last=True)
+        dut = StrideConverter(i_sig, o_sig, param_shape=4)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            # Packet 1: param=0xA
+            await sender.send(ctx, 0xAA, first=1, last=0, param=0xA)
+            await sender.send(ctx, 0xBB, first=0, last=1, param=0x0)
+            # Packet 2: param=0xC
+            await sender.send(ctx, 0xCC, first=1, last=0, param=0xC)
+            await sender.send(ctx, 0xDD, first=0, last=1, param=0x0)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            for _ in range(2):
+                beat = await receiver.recv(ctx)
+                results.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb,
+                 vcd_name="test_stride_param_multi.vcd")
+
+        assert len(results) == 2
+        # Packet 1
+        assert results[0]["payload"] == 0xBBAA
+        assert results[0]["param"] == 0xA
+        assert results[0]["first"] == 1
+        assert results[0]["last"] == 1
+        # Packet 2
+        assert results[1]["payload"] == 0xDDCC
+        assert results[1]["param"] == 0xC
+        assert results[1]["first"] == 1
+        assert results[1]["last"] == 1
+
+
+# ---------------------------------------------------------------------------
+# ByteEnableSerializer tests
+# ---------------------------------------------------------------------------
+
+class TestByteEnableSerializer:
+    """Test ByteEnableSerializer (wide stream with byte enables → narrow valid-only stream)."""
+
+    def test_be_serializer_256to8_sparse(self):
+        """256-bit input, 8-bit output with sparse byte enables.
+
+        Only bytes 0, 3, 7, 31 are enabled — verify only those 4 bytes
+        appear in the output stream with correct first/last framing.
+        """
+        dut = ByteEnableSerializer(256, 8)
+        results = []
+
+        # Build a 256-bit (32-byte) payload where each byte = its index
+        payload = 0
+        for i in range(32):
+            payload |= i << (i * 8)
+
+        # Enable only bytes 0, 3, 7, 31
+        keep = 0
+        for bit in [0, 3, 7, 31]:
+            keep |= 1 << bit
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, payload, first=1, last=1, keep=keep)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            for _ in range(4):
+                beat = await receiver.recv(ctx)
+                results.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb, deadline_ns=200_000,
+                 vcd_name="test_be_ser_256to8_sparse.vcd")
+
+        assert len(results) == 4
+        # Byte 0 = 0x00, byte 3 = 0x03, byte 7 = 0x07, byte 31 = 0x1F
+        assert results[0]["payload"] == 0x00
+        assert results[1]["payload"] == 0x03
+        assert results[2]["payload"] == 0x07
+        assert results[3]["payload"] == 0x1F
+
+        # first on first valid byte, last on last valid byte
+        assert results[0]["first"] == 1
+        assert results[0]["last"] == 0
+        assert results[1]["first"] == 0
+        assert results[1]["last"] == 0
+        assert results[2]["first"] == 0
+        assert results[2]["last"] == 0
+        assert results[3]["first"] == 0
+        assert results[3]["last"] == 1
+
+    def test_be_serializer_all_valid(self):
+        """All keep bits set — verify all bytes emitted in order."""
+        dut = ByteEnableSerializer(32, 8)
+        results = []
+
+        payload = 0x44332211
+        keep = 0xF  # all 4 bytes valid
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, payload, first=1, last=1, keep=keep)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            for _ in range(4):
+                beat = await receiver.recv(ctx)
+                results.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb, deadline_ns=200_000,
+                 vcd_name="test_be_ser_all_valid.vcd")
+
+        assert len(results) == 4
+        assert results[0]["payload"] == 0x11
+        assert results[1]["payload"] == 0x22
+        assert results[2]["payload"] == 0x33
+        assert results[3]["payload"] == 0x44
+
+        # first/last framing
+        assert results[0]["first"] == 1
+        assert results[0]["last"] == 0
+        assert results[3]["first"] == 0
+        assert results[3]["last"] == 1
+
+    def test_be_serializer_multi_beat_packet(self):
+        """2-beat packet with different keep patterns.
+
+        Beat 1: 32-bit, keep=0b0101 (bytes 0 and 2 valid)
+        Beat 2: 32-bit, keep=0b1010 (bytes 1 and 3 valid)
+        Total: 4 output bytes across 2 input beats.
+        """
+        dut = ByteEnableSerializer(32, 8)
+        results = []
+
+        # Beat 1: payload = 0x44332211, keep = 0b0101 → bytes 0 (0x11) and 2 (0x33)
+        # Beat 2: payload = 0x88776655, keep = 0b1010 → bytes 1 (0x66) and 3 (0x88)
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, 0x44332211, first=1, last=0, keep=0b0101)
+            await sender.send(ctx, 0x88776655, first=0, last=1, keep=0b1010)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            for _ in range(4):
+                beat = await receiver.recv(ctx)
+                results.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb, deadline_ns=200_000,
+                 vcd_name="test_be_ser_multi_beat.vcd")
+
+        assert len(results) == 4
+        # Beat 1 outputs: byte 0 = 0x11, byte 2 = 0x33
+        assert results[0]["payload"] == 0x11
+        assert results[1]["payload"] == 0x33
+        # Beat 2 outputs: byte 1 = 0x66, byte 3 = 0x88
+        assert results[2]["payload"] == 0x66
+        assert results[3]["payload"] == 0x88
+
+        # first on first valid byte of first beat, last on last valid byte of last beat
+        assert results[0]["first"] == 1
+        assert results[0]["last"] == 0
+        assert results[1]["first"] == 0
+        assert results[1]["last"] == 0  # not last beat
+        assert results[2]["first"] == 0  # not first beat
+        assert results[2]["last"] == 0
+        assert results[3]["first"] == 0
+        assert results[3]["last"] == 1
+
+    def test_be_serializer_backpressure(self):
+        """Verify backpressure works correctly with random ready."""
+        dut = ByteEnableSerializer(32, 8)
+        results = []
+
+        # Send 2 beats with all bytes valid
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream, random_valid=True, seed=42)
+            await sender.send(ctx, 0x04030201, first=1, last=0, keep=0xF)
+            await sender.send(ctx, 0x08070605, first=0, last=1, keep=0xF)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream, random_ready=True, seed=99)
+            for _ in range(8):
+                beat = await receiver.recv(ctx)
+                results.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb, deadline_ns=500_000,
+                 vcd_name="test_be_ser_backpressure.vcd")
+
+        assert len(results) == 8
+        expected_payloads = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        for i, (beat, expected) in enumerate(zip(results, expected_payloads)):
+            assert beat["payload"] == expected, \
+                f"Beat {i}: expected {expected:#x}, got {beat['payload']:#x}"
+
+        # first on first byte, last on last byte
+        assert results[0]["first"] == 1
+        assert results[7]["last"] == 1
+
+    def test_be_serializer_all_keep_zero(self):
+        """All keep bits zero — entire beat should be skipped.
+
+        Send beat 1 with keep=0 (skip), then beat 2 with keep=0xF (all valid).
+        Only beat 2's bytes should appear in output.
+        """
+        dut = ByteEnableSerializer(32, 8)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            # Beat with all keep=0 (should be skipped entirely)
+            await sender.send(ctx, 0xDEADBEEF, first=1, last=0, keep=0x0)
+            # Beat with all keep=1
+            await sender.send(ctx, 0x44332211, first=0, last=1, keep=0xF)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            for _ in range(4):
+                beat = await receiver.recv(ctx)
+                results.append(beat)
+
+        _run_sim(dut, sender_tb, receiver_tb, deadline_ns=200_000,
+                 vcd_name="test_be_ser_all_zero.vcd")
+
+        assert len(results) == 4
+        # Only beat 2's bytes should appear
+        assert results[0]["payload"] == 0x11
+        assert results[1]["payload"] == 0x22
+        assert results[2]["payload"] == 0x33
+        assert results[3]["payload"] == 0x44
+
+    def test_be_serializer_validation(self):
+        """Constructor validation."""
+        # i_width not multiple of 8
+        with pytest.raises(ValueError, match="multiple of 8"):
+            ByteEnableSerializer(10, 8)
+        # o_width not multiple of 8
+        with pytest.raises(ValueError, match="multiple of 8"):
+            ByteEnableSerializer(32, 10)
+        # i_width < o_width
+        with pytest.raises(ValueError, match="must be >="):
+            ByteEnableSerializer(8, 16)

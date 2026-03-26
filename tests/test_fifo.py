@@ -594,6 +594,78 @@ class TestStreamCDC:
         assert results[0]["first"] == 1
         assert results[2]["last"] == 1
 
+    def test_cdc_same_domain_latency(self):
+        """Same-domain StreamCDC has 1-cycle latency (PipeValid)."""
+        sig = Signature(unsigned(8))
+        dut = StreamCDC(sig, w_domain="sync", r_domain="sync")
+        latency_cycles = []
+
+        async def testbench(ctx):
+            # Hold ready high so data flows through immediately
+            ctx.set(dut.o_stream.ready, 1)
+            await ctx.tick()
+
+            # Assert valid + payload on input
+            ctx.set(dut.i_stream.valid, 1)
+            ctx.set(dut.i_stream.payload, 0x42)
+            await ctx.tick()
+
+            # After 1 cycle, output should be valid (PipeValid = 1-cycle latency)
+            o_valid = ctx.get(dut.o_stream.valid)
+            o_payload = ctx.get(dut.o_stream.payload)
+            latency_cycles.append((o_valid, o_payload))
+
+        _run_sim(dut, testbench, vcd_name="test_cdc_same_latency.vcd")
+
+        # PipeValid: data appears after exactly 1 cycle
+        assert latency_cycles[0] == (1, 0x42), (
+            f"Expected (valid=1, payload=0x42) after 1 cycle, "
+            f"got {latency_cycles[0]}"
+        )
+
+    def test_cdc_same_domain_data(self):
+        """Same-domain StreamCDC passes data correctly."""
+        sig = Signature(unsigned(8))
+        dut = StreamCDC(sig, w_domain="sync", r_domain="sync")
+        results = []
+        expected = [0x01, 0x02, 0x03, 0x04, 0x55, 0xAA, 0xFF, 0x00]
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            for val in expected:
+                await sender.send(ctx, val)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            for _ in expected:
+                beat = await receiver.recv(ctx)
+                results.append(beat["payload"])
+
+        _run_sim(dut, sender_tb, receiver_tb, vcd_name="test_cdc_same_data.vcd")
+        assert results == expected
+
+    def test_cdc_same_domain_backpressure(self):
+        """Same-domain StreamCDC handles backpressure correctly."""
+        sig = Signature(unsigned(8))
+        dut = StreamCDC(sig, w_domain="sync", r_domain="sync")
+        results = []
+        expected = [random.Random(88).randint(0, 255) for _ in range(30)]
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream, random_valid=True, seed=700)
+            for val in expected:
+                await sender.send(ctx, val)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream, random_ready=True, seed=800)
+            for _ in expected:
+                beat = await receiver.recv(ctx)
+                results.append(beat["payload"])
+
+        _run_sim(dut, sender_tb, receiver_tb,
+                 deadline_ns=500_000, vcd_name="test_cdc_same_backpressure.vcd")
+        assert results == expected
+
 
 # ===========================================================================
 # StreamCDC constructor validation

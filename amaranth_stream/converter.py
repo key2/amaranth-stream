@@ -21,6 +21,7 @@ __all__ = [
     "StreamCast",
     "Pack",
     "Unpack",
+    "ByteEnableSerializer",
 ]
 
 
@@ -264,6 +265,12 @@ class StrideConverter(wiring.Component):
         Input stream signature.
     o_signature : :class:`~amaranth_stream.Signature`
         Output stream signature.
+    param_shape : :class:`~.hdl.ShapeLike` or ``None``
+        If not ``None``, both input and output signatures are augmented
+        with a ``param`` sideband field of the given shape.  During
+        width conversion the ``param`` value from the first input beat
+        (upconvert) or the single input beat (downconvert) is held
+        constant across all corresponding output beats.
 
     Ports
     -----
@@ -273,7 +280,7 @@ class StrideConverter(wiring.Component):
         Output stream.
     """
 
-    def __init__(self, i_signature, o_signature):
+    def __init__(self, i_signature, o_signature, *, param_shape=None):
         if not isinstance(i_signature, StreamSignature):
             raise TypeError(
                 f"Expected amaranth_stream.Signature for i_signature, "
@@ -282,6 +289,25 @@ class StrideConverter(wiring.Component):
             raise TypeError(
                 f"Expected amaranth_stream.Signature for o_signature, "
                 f"got {type(o_signature).__name__}")
+
+        # When param_shape is provided, rebuild signatures with param support
+        if param_shape is not None:
+            i_signature = StreamSignature(
+                i_signature.payload_shape,
+                always_valid=i_signature.always_valid,
+                always_ready=i_signature.always_ready,
+                has_first_last=i_signature.has_first_last,
+                param_shape=param_shape,
+                has_keep=i_signature.has_keep,
+            )
+            o_signature = StreamSignature(
+                o_signature.payload_shape,
+                always_valid=o_signature.always_valid,
+                always_ready=o_signature.always_ready,
+                has_first_last=o_signature.has_first_last,
+                param_shape=param_shape,
+                has_keep=o_signature.has_keep,
+            )
 
         self._i_sig = i_signature
         self._o_sig = o_signature
@@ -309,6 +335,9 @@ class StrideConverter(wiring.Component):
         i_ratio = self._i_ratio
         o_ratio = self._o_ratio
 
+        has_param = (self._i_sig.param_shape is not None and
+                     self._o_sig.param_shape is not None)
+
         if i_width == o_width:
             # Identity: wire-through
             m.domains += ClockDomain("sync")
@@ -324,6 +353,8 @@ class StrideConverter(wiring.Component):
                 ]
             if self._i_sig.has_keep and self._o_sig.has_keep:
                 m.d.comb += self.o_stream.keep.eq(self.i_stream.keep)
+            if has_param:
+                m.d.comb += self.o_stream.param.eq(self.i_stream.param)
             return m
 
         # General case: collect i_ratio input beats into LCM buffer,
@@ -331,6 +362,23 @@ class StrideConverter(wiring.Component):
         buf = Signal(lcm_width)
         i_counter = Signal(range(i_ratio))
         o_counter = Signal(range(o_ratio))
+
+        has_fl = self._i_sig.has_first_last and self._o_sig.has_first_last
+        has_keep_io = self._i_sig.has_keep and self._o_sig.has_keep
+
+        if has_fl:
+            first_reg = Signal()
+            last_reg = Signal()
+
+        if has_keep_io:
+            i_keep_width = max(1, math.ceil(i_width / 8))
+            o_keep_width = max(1, math.ceil(o_width / 8))
+            lcm_keep_width = max(1, math.ceil(lcm_width / 8))
+            keep_reg = Signal(lcm_keep_width)
+
+        if has_param:
+            param_shape = Shape.cast(self._i_sig.param_shape)
+            param_reg = Signal(param_shape)
 
         # States: FILL (collecting input), DRAIN (outputting)
         with m.FSM():
@@ -344,7 +392,34 @@ class StrideConverter(wiring.Component):
                             m.d.sync += buf[i * i_width:(i + 1) * i_width].eq(
                                 self.i_stream.payload)
 
-                    with m.If(i_counter == i_ratio - 1):
+                    if has_fl:
+                        # Capture first from the first input beat
+                        with m.If(i_counter == 0):
+                            m.d.sync += first_reg.eq(self.i_stream.first)
+                        # Always capture last — needed for early-last detection
+                        m.d.sync += last_reg.eq(self.i_stream.last)
+
+                    if has_keep_io:
+                        for i in range(i_ratio):
+                            with m.If(i_counter == i):
+                                m.d.sync += keep_reg[i * i_keep_width:(i + 1) * i_keep_width].eq(
+                                    self.i_stream.keep)
+
+                    if has_param:
+                        # Capture param from the first input beat only
+                        with m.If(i_counter == 0):
+                            m.d.sync += param_reg.eq(self.i_stream.param)
+
+                    # Transition to DRAIN when buffer is full OR when last is seen
+                    with m.If((i_counter == i_ratio - 1) | (has_fl and self.i_stream.last)):
+                        # Zero-pad unfilled buffer slots
+                        if i_ratio > 1:
+                            for i in range(1, i_ratio):
+                                with m.If(i_counter < i):
+                                    m.d.sync += buf[(i) * i_width:(i + 1) * i_width].eq(0)
+                                    if has_keep_io:
+                                        m.d.sync += keep_reg[(i) * i_keep_width:(i + 1) * i_keep_width].eq(0)
+
                         m.d.sync += [
                             i_counter.eq(0),
                             o_counter.eq(0),
@@ -361,6 +436,22 @@ class StrideConverter(wiring.Component):
                     with m.If(o_counter == i):
                         m.d.comb += self.o_stream.payload.eq(
                             buf[i * o_width:(i + 1) * o_width])
+
+                if has_fl:
+                    m.d.comb += [
+                        self.o_stream.first.eq(first_reg & (o_counter == 0)),
+                        self.o_stream.last.eq(last_reg & (o_counter == o_ratio - 1)),
+                    ]
+
+                if has_keep_io:
+                    for i in range(o_ratio):
+                        with m.If(o_counter == i):
+                            m.d.comb += self.o_stream.keep.eq(
+                                keep_reg[i * o_keep_width:(i + 1) * o_keep_width])
+
+                if has_param:
+                    # Hold param constant for all output beats
+                    m.d.comb += self.o_stream.param.eq(param_reg)
 
                 with m.If(self.o_stream.valid & self.o_stream.ready):
                     with m.If(o_counter == o_ratio - 1):
@@ -411,6 +502,16 @@ class Gearbox(wiring.Component):
     def elaborate(self, platform):
         m = Module()
 
+        i_width = self._i_width
+        o_width = self._o_width
+
+        if not self._has_first_last:
+            return self._elaborate_continuous(m)
+        else:
+            return self._elaborate_packet(m)
+
+    def _elaborate_continuous(self, m):
+        """Original continuous (non-packet) gearbox logic."""
         i_width = self._i_width
         o_width = self._o_width
         lcm_w = math.lcm(i_width, o_width)
@@ -478,6 +579,161 @@ class Gearbox(wiring.Component):
             m.d.sync += level.eq(level + i_width)
         with m.Elif(do_read):
             m.d.sync += level.eq(level - o_width)
+
+        return m
+
+    def _elaborate_packet(self, m):
+        """Packet-aware gearbox with first/last support.
+
+        Uses an FSM with FILL and DRAIN states. During FILL, input beats
+        are accumulated into a shift register buffer. When the buffer has
+        enough bits for an output beat, or when ``last`` is seen on the
+        input, the FSM transitions to DRAIN to emit output beats.
+
+        ``first`` from the first input beat of a packet is propagated to
+        the first output beat. ``last`` from the last input beat is
+        propagated to the last output beat. When ``last`` arrives and
+        there are remaining bits that don't fill a complete output beat,
+        a partial beat is emitted with the remaining data (zero-padded
+        to output width).
+        """
+        i_width = self._i_width
+        o_width = self._o_width
+        lcm_w = math.lcm(i_width, o_width)
+
+        # Maximum bits we might buffer: one full LCM cycle
+        n_in = lcm_w // i_width
+        n_out = lcm_w // o_width
+
+        # Buffer and level tracking
+        buf = Signal(lcm_w)
+        level = Signal(range(lcm_w + i_width + 1))
+
+        # Input position counter (which slot in the buffer to write next)
+        i_counter = Signal(range(n_in))
+        # Output position counter (which slot in the buffer to read next)
+        o_counter = Signal(range(n_out))
+
+        # Packet framing registers
+        first_reg = Signal()    # captured from first input beat of packet
+        last_seen = Signal()    # set when input last is seen
+        first_out = Signal()    # tracks whether first output beat has been emitted
+
+        # How many complete output beats to drain, plus whether there's a partial
+        drain_count = Signal(range(n_out + 1))
+        drain_idx = Signal(range(n_out + 1))
+        has_partial = Signal()
+
+        with m.FSM():
+            with m.State("FILL"):
+                m.d.comb += [
+                    self.i_stream.ready.eq(1),
+                    self.o_stream.valid.eq(0),
+                ]
+
+                with m.If(self.i_stream.valid & self.i_stream.ready):
+                    # Store input data into buffer at current position
+                    for idx in range(n_in):
+                        with m.If(i_counter == idx):
+                            m.d.sync += buf[idx * i_width:(idx + 1) * i_width].eq(
+                                self.i_stream.payload)
+
+                    # Track first: capture from the very first input beat
+                    # (when level == 0 and i_counter == 0, it's a new packet)
+                    with m.If((level == 0) & (i_counter == 0) & ~first_out):
+                        m.d.sync += first_reg.eq(self.i_stream.first)
+
+                    # Update level and counter
+                    new_level = Signal.like(level, name="new_level")
+                    m.d.comb += new_level.eq(level + i_width)
+                    m.d.sync += level.eq(new_level)
+
+                    with m.If(i_counter == n_in - 1):
+                        m.d.sync += i_counter.eq(0)
+                    with m.Else():
+                        m.d.sync += i_counter.eq(i_counter + 1)
+
+                    # Check if we should transition to DRAIN:
+                    # 1) Buffer has enough for at least one output beat, OR
+                    # 2) last is seen on input (flush remaining)
+                    with m.If(self.i_stream.last):
+                        # Last seen: compute how many full output beats + partial
+                        m.d.sync += last_seen.eq(1)
+                        m.d.sync += drain_idx.eq(0)
+                        m.next = "DRAIN"
+                    with m.Elif(new_level >= o_width):
+                        # Enough data for at least one output beat
+                        m.d.sync += last_seen.eq(0)
+                        m.d.sync += drain_idx.eq(0)
+                        m.next = "DRAIN"
+
+            with m.State("DRAIN"):
+                m.d.comb += [
+                    self.i_stream.ready.eq(0),
+                    self.o_stream.valid.eq(1),
+                ]
+
+                # Output the current slice from the buffer
+                for idx in range(n_out):
+                    with m.If(o_counter == idx):
+                        m.d.comb += self.o_stream.payload.eq(
+                            buf[idx * o_width:(idx + 1) * o_width])
+
+                # Determine if this is the last output beat
+                # It's the last beat if: last_seen AND remaining level
+                # after this beat would be < o_width (or zero)
+                remaining_after = Signal.like(level, name="remaining_after")
+                m.d.comb += remaining_after.eq(level - o_width)
+
+                is_last_beat = Signal()
+                m.d.comb += is_last_beat.eq(
+                    last_seen & (level <= o_width)
+                )
+
+                # Determine if this is the first output beat of the packet
+                is_first_beat = Signal()
+                m.d.comb += is_first_beat.eq(first_reg & ~first_out)
+
+                # Drive first/last
+                m.d.comb += [
+                    self.o_stream.first.eq(is_first_beat),
+                    self.o_stream.last.eq(is_last_beat),
+                ]
+
+                with m.If(self.o_stream.valid & self.o_stream.ready):
+                    # Mark first as emitted
+                    with m.If(is_first_beat):
+                        m.d.sync += first_out.eq(1)
+
+                    with m.If(is_last_beat):
+                        # End of packet: reset all state
+                        m.d.sync += [
+                            level.eq(0),
+                            i_counter.eq(0),
+                            o_counter.eq(0),
+                            first_reg.eq(0),
+                            last_seen.eq(0),
+                            first_out.eq(0),
+                            drain_idx.eq(0),
+                        ]
+                        # Zero out the buffer for clean start
+                        m.d.sync += buf.eq(0)
+                        m.next = "FILL"
+                    with m.Else():
+                        # More beats to drain
+                        m.d.sync += [
+                            level.eq(level - o_width),
+                            drain_idx.eq(drain_idx + 1),
+                        ]
+                        with m.If(o_counter == n_out - 1):
+                            m.d.sync += o_counter.eq(0)
+                        with m.Else():
+                            m.d.sync += o_counter.eq(o_counter + 1)
+
+                        # If not last_seen and remaining level < o_width,
+                        # go back to FILL to get more data
+                        with m.If(~last_seen & (remaining_after < o_width)):
+                            m.next = "FILL"
 
         return m
 
@@ -792,5 +1048,165 @@ class Unpack(wiring.Component):
                 m.d.sync += active.eq(0)
             with m.Else():
                 m.d.sync += counter.eq(counter + 1)
+
+        return m
+
+
+class ByteEnableSerializer(wiring.Component):
+    """Serialize a wide stream with byte enables into a narrow stream of valid bytes.
+
+    Converts a wide input stream (e.g. 256-bit with 32-bit byte-enable mask)
+    into a narrow output stream (e.g. 8-bit) by emitting only the bytes/chunks
+    whose corresponding ``keep`` bits are set, skipping those where ``keep=0``.
+
+    This is useful for things like PCIe TLP sniffers that need to serialize a
+    256-bit stream with sparse byte enables down to an 8-bit byte stream.
+
+    Parameters
+    ----------
+    i_width : :class:`int`
+        Input data width in bits. Must be a multiple of 8.
+    o_width : :class:`int`
+        Output data width in bits (default 8). Must be a multiple of 8.
+        ``i_width`` must be >= ``o_width``.
+
+    Ports
+    -----
+    i_stream : In(Signature(i_width, has_first_last=True, has_keep=True))
+        Input stream with byte enables.
+    o_stream : Out(Signature(o_width, has_first_last=True))
+        Output stream (all output bytes are valid, no keep needed).
+    """
+
+    def __init__(self, i_width, o_width=8):
+        if i_width % 8 != 0:
+            raise ValueError(f"i_width must be a multiple of 8, got {i_width}")
+        if o_width % 8 != 0:
+            raise ValueError(f"o_width must be a multiple of 8, got {o_width}")
+        if i_width < o_width:
+            raise ValueError(
+                f"i_width ({i_width}) must be >= o_width ({o_width})")
+
+        self._i_width = i_width
+        self._o_width = o_width
+        self._n_chunks = i_width // o_width
+        self._keep_per_chunk = o_width // 8
+
+        i_sig = StreamSignature(i_width, has_first_last=True, has_keep=True)
+        o_sig = StreamSignature(o_width, has_first_last=True)
+
+        super().__init__({
+            "i_stream": In(i_sig),
+            "o_stream": Out(o_sig),
+        })
+
+    def elaborate(self, platform):
+        m = Module()
+
+        i_width = self._i_width
+        o_width = self._o_width
+        n_chunks = self._n_chunks
+        keep_per_chunk = self._keep_per_chunk
+        keep_width = i_width // 8  # total keep bits
+
+        # Latched input data
+        data_reg = Signal(i_width)
+        keep_reg = Signal(keep_width)
+        first_reg = Signal()
+        last_reg = Signal()
+
+        # Current chunk position counter
+        counter = Signal(range(n_chunks))
+
+        # Track whether we've emitted the first valid byte of this beat
+        first_emitted = Signal()
+
+        # Precompute per-chunk keep: for each chunk, all keep bits must be set
+        # (or we use any-bit-set for the chunk to be considered valid)
+        chunk_valid = Signal(n_chunks)
+        for i in range(n_chunks):
+            if keep_per_chunk == 1:
+                m.d.comb += chunk_valid[i].eq(keep_reg[i])
+            else:
+                # Chunk is valid if ANY of its keep bits are set
+                m.d.comb += chunk_valid[i].eq(
+                    keep_reg[i * keep_per_chunk:(i + 1) * keep_per_chunk].any())
+
+        # Find the last valid chunk index (for last propagation)
+        # In Amaranth, the last m.d.comb assignment wins, so iterate
+        # forward: the highest valid index will be the last assignment.
+        last_valid_chunk = Signal(range(n_chunks))
+        for i in range(n_chunks):
+            with m.If(chunk_valid[i]):
+                m.d.comb += last_valid_chunk.eq(i)
+
+        # Current chunk's keep validity
+        cur_chunk_valid = Signal()
+        for i in range(n_chunks):
+            with m.If(counter == i):
+                m.d.comb += cur_chunk_valid.eq(chunk_valid[i])
+
+        # Current chunk's data
+        for i in range(n_chunks):
+            with m.If(counter == i):
+                m.d.comb += self.o_stream.payload.eq(
+                    data_reg[i * o_width:(i + 1) * o_width])
+
+        with m.FSM():
+            with m.State("IDLE"):
+                # Accept input
+                m.d.comb += self.i_stream.ready.eq(1)
+                m.d.comb += self.o_stream.valid.eq(0)
+
+                with m.If(self.i_stream.valid):
+                    m.d.sync += [
+                        data_reg.eq(self.i_stream.payload),
+                        keep_reg.eq(self.i_stream.keep),
+                        first_reg.eq(self.i_stream.first),
+                        last_reg.eq(self.i_stream.last),
+                        counter.eq(0),
+                        first_emitted.eq(0),
+                    ]
+                    m.next = "DRAIN"
+
+            with m.State("DRAIN"):
+                m.d.comb += self.i_stream.ready.eq(0)
+
+                with m.If(cur_chunk_valid):
+                    # This chunk has valid data — present it
+                    m.d.comb += self.o_stream.valid.eq(1)
+
+                    # first: set on the first valid output byte of this beat
+                    m.d.comb += self.o_stream.first.eq(
+                        first_reg & ~first_emitted)
+
+                    # last: set on the last valid output byte of this beat
+                    is_last_valid = Signal()
+                    m.d.comb += is_last_valid.eq(counter == last_valid_chunk)
+                    m.d.comb += self.o_stream.last.eq(
+                        last_reg & is_last_valid)
+
+                    # Wait for handshake
+                    with m.If(self.o_stream.ready):
+                        m.d.sync += first_emitted.eq(1)
+
+                        with m.If(counter == n_chunks - 1):
+                            # Done with this beat
+                            m.next = "IDLE"
+                        with m.Elif(is_last_valid):
+                            # No more valid chunks after this one
+                            m.next = "IDLE"
+                        with m.Else():
+                            m.d.sync += counter.eq(counter + 1)
+
+                with m.Else():
+                    # This chunk is not valid — skip it
+                    m.d.comb += self.o_stream.valid.eq(0)
+
+                    with m.If(counter == n_chunks - 1):
+                        # Done with this beat (all remaining were invalid)
+                        m.next = "IDLE"
+                    with m.Else():
+                        m.d.sync += counter.eq(counter + 1)
 
         return m

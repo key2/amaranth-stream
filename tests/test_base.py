@@ -385,3 +385,323 @@ class TestCoreToExtended:
     def test_type_error_on_string(self):
         with pytest.raises(TypeError):
             core_to_extended("not a signature")
+
+
+# ---------------------------------------------------------------------------
+# connect_streams
+# ---------------------------------------------------------------------------
+
+from amaranth import Module
+from amaranth.hdl import unsigned
+from amaranth.lib.wiring import In, Out
+from amaranth.sim import Simulator, Period
+
+from amaranth_stream._base import connect_streams
+from amaranth_stream.sim import StreamSimSender, StreamSimReceiver
+
+
+def _run_sim(dut, *testbenches, deadline_ns=50_000, vcd_name="test_connect.vcd"):
+    """Helper to run a simulation with one or more testbenches."""
+    sim = Simulator(dut)
+    sim.add_clock(Period(MHz=10))
+    for tb in testbenches:
+        sim.add_testbench(tb)
+    with sim.write_vcd(vcd_name):
+        sim.run_until(Period(ns=deadline_ns))
+
+
+from amaranth.hdl import ClockDomain
+
+
+class _ConnectBridge(wiring.Component):
+    """Trivial component that connects i_stream → o_stream via connect_streams."""
+
+    def __init__(self, src_sig, dst_sig=None, *, exclude=None):
+        self._src_sig = src_sig
+        self._dst_sig = dst_sig if dst_sig is not None else src_sig
+        self._exclude = exclude
+        super().__init__({
+            "i_stream": In(self._src_sig),
+            "o_stream": Out(self._dst_sig),
+        })
+
+    def elaborate(self, platform):
+        m = Module()
+        # Add a sync domain so the simulator can add a clock
+        m.domains += ClockDomain("sync")
+        connect_streams(m, wiring.flipped(self.i_stream),
+                        wiring.flipped(self.o_stream),
+                        exclude=self._exclude)
+        return m
+
+
+class TestConnectStreamsBasic:
+    """test_connect_streams_basic — connect two simple streams, send data, verify."""
+
+    def test_basic_data_transfer(self):
+        sig = Signature(unsigned(8))
+        dut = _ConnectBridge(sig)
+        results = []
+        expected = [0x10, 0x20, 0x30, 0x40, 0x50]
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            for val in expected:
+                await sender.send(ctx, val)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            for _ in expected:
+                beat = await receiver.recv(ctx)
+                results.append(beat["payload"])
+
+        _run_sim(dut, sender_tb, receiver_tb, vcd_name="test_cs_basic.vcd")
+        assert results == expected
+
+    def test_basic_backpressure(self):
+        sig = Signature(unsigned(8))
+        dut = _ConnectBridge(sig)
+        results = []
+        expected = [0xAA, 0xBB, 0xCC, 0xDD]
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream, random_valid=True, seed=11)
+            for val in expected:
+                await sender.send(ctx, val)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream, random_ready=True, seed=22)
+            for _ in expected:
+                beat = await receiver.recv(ctx)
+                results.append(beat["payload"])
+
+        _run_sim(dut, sender_tb, receiver_tb,
+                 deadline_ns=100_000, vcd_name="test_cs_basic_bp.vcd")
+        assert results == expected
+
+
+class TestConnectStreamsWithFirstLast:
+    """test_connect_streams_with_first_last — verify first/last propagation."""
+
+    def test_first_last_propagation(self):
+        sig = Signature(unsigned(8), has_first_last=True)
+        dut = _ConnectBridge(sig)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send_packet(ctx, [0x10, 0x20, 0x30])
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            packet = await receiver.recv_packet(ctx)
+            results.extend(packet)
+
+        _run_sim(dut, sender_tb, receiver_tb, vcd_name="test_cs_first_last.vcd")
+
+        assert len(results) == 3
+        assert results[0]["payload"] == 0x10
+        assert results[0]["first"] == 1
+        assert results[0]["last"] == 0
+        assert results[1]["payload"] == 0x20
+        assert results[1]["first"] == 0
+        assert results[1]["last"] == 0
+        assert results[2]["payload"] == 0x30
+        assert results[2]["first"] == 0
+        assert results[2]["last"] == 1
+
+
+class TestConnectStreamsWithKeepParam:
+    """test_connect_streams_with_keep_param — verify keep and param propagation."""
+
+    def test_param_propagation(self):
+        sig = Signature(unsigned(8), param_shape=unsigned(4))
+        dut = _ConnectBridge(sig)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, 0xAA, param=0x5)
+            await sender.send(ctx, 0xBB, param=0xA)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            results.append(await receiver.recv(ctx))
+            results.append(await receiver.recv(ctx))
+
+        _run_sim(dut, sender_tb, receiver_tb, vcd_name="test_cs_param.vcd")
+
+        assert results[0]["payload"] == 0xAA
+        assert results[0]["param"] == 0x5
+        assert results[1]["payload"] == 0xBB
+        assert results[1]["param"] == 0xA
+
+    def test_keep_propagation(self):
+        sig = Signature(unsigned(16), has_keep=True)
+        dut = _ConnectBridge(sig)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, 0x1234, keep=0x3)
+            await sender.send(ctx, 0x5678, keep=0x1)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            results.append(await receiver.recv(ctx))
+            results.append(await receiver.recv(ctx))
+
+        _run_sim(dut, sender_tb, receiver_tb, vcd_name="test_cs_keep.vcd")
+
+        assert results[0]["payload"] == 0x1234
+        assert results[0]["keep"] == 0x3
+        assert results[1]["payload"] == 0x5678
+        assert results[1]["keep"] == 0x1
+
+    def test_all_optional_signals(self):
+        sig = Signature(unsigned(8), has_first_last=True,
+                        param_shape=unsigned(4), has_keep=True)
+        dut = _ConnectBridge(sig)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, 0xAA, first=1, last=0, param=0x3, keep=0x1)
+            await sender.send(ctx, 0xBB, first=0, last=1, param=0x7, keep=0x1)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            results.append(await receiver.recv(ctx))
+            results.append(await receiver.recv(ctx))
+
+        _run_sim(dut, sender_tb, receiver_tb, vcd_name="test_cs_all_opt.vcd")
+
+        assert results[0]["payload"] == 0xAA
+        assert results[0]["first"] == 1
+        assert results[0]["last"] == 0
+        assert results[0]["param"] == 0x3
+        assert results[0]["keep"] == 0x1
+        assert results[1]["payload"] == 0xBB
+        assert results[1]["first"] == 0
+        assert results[1]["last"] == 1
+        assert results[1]["param"] == 0x7
+        assert results[1]["keep"] == 0x1
+
+
+class TestConnectStreamsExclude:
+    """test_connect_streams_exclude — verify exclude parameter works."""
+
+    def test_exclude_param(self):
+        """Excluding param should leave it unconnected (default 0)."""
+        sig = Signature(unsigned(8), param_shape=unsigned(4))
+        dut = _ConnectBridge(sig, exclude={"param"})
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, 0xAA, param=0xF)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            results.append(await receiver.recv(ctx))
+
+        _run_sim(dut, sender_tb, receiver_tb, vcd_name="test_cs_exclude.vcd")
+
+        assert results[0]["payload"] == 0xAA
+        # param should be 0 (unconnected, default)
+        assert results[0]["param"] == 0
+
+    def test_exclude_first_last(self):
+        """Excluding first and last should leave them unconnected."""
+        sig = Signature(unsigned(8), has_first_last=True)
+        dut = _ConnectBridge(sig, exclude={"first", "last"})
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, 0x42, first=1, last=1)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            results.append(await receiver.recv(ctx))
+
+        _run_sim(dut, sender_tb, receiver_tb, vcd_name="test_cs_exclude_fl.vcd")
+
+        assert results[0]["payload"] == 0x42
+        assert results[0]["first"] == 0
+        assert results[0]["last"] == 0
+
+
+class TestConnectStreamsMismatchedOptional:
+    """test_connect_streams_mismatched_optional — graceful handling of mismatched fields."""
+
+    def test_src_has_first_last_dst_does_not(self):
+        """src has first/last but dst doesn't — should connect without error."""
+        src_sig = Signature(unsigned(8), has_first_last=True)
+        dst_sig = Signature(unsigned(8))
+        dut = _ConnectBridge(src_sig, dst_sig)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, 0xDE, first=1, last=1)
+            await sender.send(ctx, 0xAD)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            results.append(await receiver.recv(ctx))
+            results.append(await receiver.recv(ctx))
+
+        _run_sim(dut, sender_tb, receiver_tb, vcd_name="test_cs_mismatch1.vcd")
+
+        assert results[0]["payload"] == 0xDE
+        assert results[1]["payload"] == 0xAD
+        # dst has no first/last, so they shouldn't be in the result
+        assert "first" not in results[0]
+        assert "last" not in results[0]
+
+    def test_dst_has_first_last_src_does_not(self):
+        """dst has first/last but src doesn't — should connect without error."""
+        src_sig = Signature(unsigned(8))
+        dst_sig = Signature(unsigned(8), has_first_last=True)
+        dut = _ConnectBridge(src_sig, dst_sig)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, 0xBE)
+            await sender.send(ctx, 0xEF)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            results.append(await receiver.recv(ctx))
+            results.append(await receiver.recv(ctx))
+
+        _run_sim(dut, sender_tb, receiver_tb, vcd_name="test_cs_mismatch2.vcd")
+
+        assert results[0]["payload"] == 0xBE
+        assert results[1]["payload"] == 0xEF
+        # first/last should be 0 (unconnected defaults)
+        assert results[0]["first"] == 0
+        assert results[0]["last"] == 0
+
+    def test_src_has_param_dst_has_keep(self):
+        """src has param, dst has keep — neither should be connected."""
+        src_sig = Signature(unsigned(8), param_shape=unsigned(4))
+        dst_sig = Signature(unsigned(8), has_keep=True)
+        dut = _ConnectBridge(src_sig, dst_sig)
+        results = []
+
+        async def sender_tb(ctx):
+            sender = StreamSimSender(dut.i_stream)
+            await sender.send(ctx, 0x42, param=0xF)
+
+        async def receiver_tb(ctx):
+            receiver = StreamSimReceiver(dut.o_stream)
+            results.append(await receiver.recv(ctx))
+
+        _run_sim(dut, sender_tb, receiver_tb, vcd_name="test_cs_mismatch3.vcd")
+
+        assert results[0]["payload"] == 0x42
+        # keep should be 0 (unconnected)
+        assert results[0]["keep"] == 0

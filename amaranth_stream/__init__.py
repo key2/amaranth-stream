@@ -1,6 +1,6 @@
 """amaranth-stream: Extended stream processing library for Amaranth HDL."""
 
-from ._base import Signature, Interface, core_to_extended
+from ._base import Signature, Interface, core_to_extended, connect_streams
 from .sim import StreamSimSender, StreamSimReceiver
 from .buffer import Buffer, PipeValid, PipeReady, Delay
 from .fifo import StreamFIFO, StreamAsyncFIFO
@@ -12,6 +12,7 @@ from .converter import (
     StreamCast,
     Pack,
     Unpack,
+    ByteEnableSerializer,
 )
 from .routing import (
     StreamMux,
@@ -32,9 +33,10 @@ from .packet import (
 )
 from .arbiter import StreamArbiter, StreamDispatcher
 from .pipeline import Pipeline, BufferizeEndpoints
-from .transform import StreamMap, StreamFilter, EndianSwap, ByteAligner
-from .monitor import StreamMonitor, StreamChecker
+from .transform import StreamMap, StreamFilter, EndianSwap, GranularEndianSwap, ByteAligner, PacketAligner, WordReorder
+from .monitor import StreamMonitor, StreamChecker, StreamProtocolChecker
 from .axi_stream import AXIStreamSignature, AXIStreamToStream, StreamToAXIStream
+from .adapter import SOPEOPAdapter, StreamToSOPEOP
 
 __all__ = [
     "Signature",
@@ -75,10 +77,18 @@ __all__ = [
     "StreamMap",
     "StreamFilter",
     "EndianSwap",
+    "GranularEndianSwap",
     "ByteAligner",
+    "PacketAligner",
+    "WordReorder",
     "StreamMonitor",
     "StreamChecker",
+    "StreamProtocolChecker",
     "AXIStreamSignature",
     "AXIStreamToStream",
     "StreamToAXIStream",
+    "SOPEOPAdapter",
+    "StreamToSOPEOP",
+    "ByteEnableSerializer",
+    "connect_streams",
 ]

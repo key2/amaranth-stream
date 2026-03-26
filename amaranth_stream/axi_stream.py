@@ -28,6 +28,8 @@ class AXIStreamSignature(wiring.Signature):
         TDEST width (0 to omit). Default 0.
     user_width : :class:`int`
         TUSER width (0 to omit). Default 0.
+    has_tfirst : :class:`bool`
+        If ``True``, include a ``tfirst`` member signal. Default ``False``.
 
     Members
     -------
@@ -37,12 +39,14 @@ class AXIStreamSignature(wiring.Signature):
     tkeep : Out(data_width // 8)
     tstrb : Out(data_width // 8)
     tlast : Out(1)
+    tfirst : Out(1) — if has_tfirst is True
     tid : Out(id_width) — if id_width > 0
     tdest : Out(dest_width) — if dest_width > 0
     tuser : Out(user_width) — if user_width > 0
     """
 
-    def __init__(self, data_width, *, id_width=0, dest_width=0, user_width=0):
+    def __init__(self, data_width, *, id_width=0, dest_width=0, user_width=0,
+                 has_tfirst=False):
         if data_width % 8 != 0:
             raise ValueError(
                 f"data_width must be a multiple of 8, got {data_width}")
@@ -50,6 +54,7 @@ class AXIStreamSignature(wiring.Signature):
         self._id_width = id_width
         self._dest_width = dest_width
         self._user_width = user_width
+        self._has_tfirst = bool(has_tfirst)
 
         members = {
             "tdata": Out(data_width),
@@ -59,6 +64,8 @@ class AXIStreamSignature(wiring.Signature):
             "tstrb": Out(data_width // 8),
             "tlast": Out(1),
         }
+        if self._has_tfirst:
+            members["tfirst"] = Out(1)
         if id_width > 0:
             members["tid"] = Out(id_width)
         if dest_width > 0:
@@ -84,12 +91,17 @@ class AXIStreamSignature(wiring.Signature):
     def user_width(self):
         return self._user_width
 
+    @property
+    def has_tfirst(self):
+        return self._has_tfirst
+
     def __eq__(self, other):
         return (isinstance(other, AXIStreamSignature) and
                 self._data_width == other._data_width and
                 self._id_width == other._id_width and
                 self._dest_width == other._dest_width and
-                self._user_width == other._user_width)
+                self._user_width == other._user_width and
+                self._has_tfirst == other._has_tfirst)
 
     def __repr__(self):
         params = [f"{self._data_width}"]
@@ -99,6 +111,8 @@ class AXIStreamSignature(wiring.Signature):
             params.append(f"dest_width={self._dest_width}")
         if self._user_width:
             params.append(f"user_width={self._user_width}")
+        if self._has_tfirst:
+            params.append("has_tfirst=True")
         return f"AXIStreamSignature({', '.join(params)})"
 
 
@@ -138,9 +152,6 @@ class AXIStreamToStream(wiring.Component):
     def elaborate(self, platform):
         m = Module()
 
-        # Track first beat: first beat after reset or after last
-        is_first = Signal(init=1, name="is_first")
-
         # Map AXI signals to stream
         m.d.comb += [
             self.o_stream.payload.eq(self.axi.tdata),
@@ -149,21 +160,25 @@ class AXIStreamToStream(wiring.Component):
         ]
 
         if self._stream_sig.has_first_last:
-            m.d.comb += [
-                self.o_stream.first.eq(is_first),
-                self.o_stream.last.eq(self.axi.tlast),
-            ]
+            m.d.comb += self.o_stream.last.eq(self.axi.tlast)
+
+            if self._axi_sig.has_tfirst:
+                # Use tfirst directly from AXI-Stream — no state tracking needed
+                m.d.comb += self.o_stream.first.eq(self.axi.tfirst)
+            else:
+                # Synthesize first from state tracking
+                is_first = Signal(init=1, name="is_first")
+                m.d.comb += self.o_stream.first.eq(is_first)
+
+                transfer = self.axi.tvalid & self.axi.tready
+                with m.If(transfer):
+                    with m.If(self.axi.tlast):
+                        m.d.sync += is_first.eq(1)
+                    with m.Else():
+                        m.d.sync += is_first.eq(0)
 
         if self._stream_sig.has_keep:
             m.d.comb += self.o_stream.keep.eq(self.axi.tkeep)
-
-        # Update first tracking on transfer
-        transfer = self.axi.tvalid & self.axi.tready
-        with m.If(transfer):
-            with m.If(self.axi.tlast):
-                m.d.sync += is_first.eq(1)
-            with m.Else():
-                m.d.sync += is_first.eq(0)
 
         return m
 
@@ -211,9 +226,11 @@ class StreamToAXIStream(wiring.Component):
             self.i_stream.ready.eq(self.axi.tready),
         ]
 
-        # Map last → tlast
+        # Map last → tlast (and first → tfirst if available)
         if self._stream_sig.has_first_last:
             m.d.comb += self.axi.tlast.eq(self.i_stream.last)
+            if self._axi_sig.has_tfirst:
+                m.d.comb += self.axi.tfirst.eq(self.i_stream.first)
 
         # Map keep → tkeep, and set tstrb = tkeep
         if self._stream_sig.has_keep:

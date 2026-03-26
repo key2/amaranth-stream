@@ -77,7 +77,9 @@ class HeaderLayout:
     Parameters
     ----------
     fields : :class:`dict`
-        Mapping of field name → (width, byte_offset).
+        Mapping of field name → ``(width, byte_offset)`` or
+        ``(width, byte_offset, bit_offset)``.  When *bit_offset* is
+        omitted it defaults to 0.
 
     Properties
     ----------
@@ -86,23 +88,61 @@ class HeaderLayout:
     byte_length : :class:`int`
         Total header bytes.
     fields : :class:`dict`
-        The original fields dict.
+        The normalised fields dict (values are always 3-tuples
+        ``(width, byte_offset, bit_offset)``).
     """
 
     def __init__(self, fields):
-        self._fields = dict(fields)
-        # Calculate byte_length from max(byte_offset + ceil(width/8))
+        # Normalise to 3-tuples (width, byte_offset, bit_offset)
+        normalised = {}
+        for name, value in dict(fields).items():
+            if len(value) == 2:
+                width, byte_offset = value
+                bit_offset = 0
+            elif len(value) == 3:
+                width, byte_offset, bit_offset = value
+            else:
+                raise ValueError(
+                    f"Field '{name}': expected (width, byte_offset) or "
+                    f"(width, byte_offset, bit_offset), got {len(value)}-tuple")
+            normalised[name] = (width, byte_offset, bit_offset)
+        self._fields = normalised
+
+        # Validate that fields don't overlap within the same byte region
+        self._validate_no_overlap()
+
+        # Calculate byte_length from max(byte_offset + ceil((bit_offset + width) / 8))
         max_end = 0
-        for name, (width, byte_offset) in self._fields.items():
-            end = byte_offset + math.ceil(width / 8)
+        for name, (width, byte_offset, bit_offset) in self._fields.items():
+            end = byte_offset + math.ceil((bit_offset + width) / 8)
             if end > max_end:
                 max_end = end
         self._byte_length = max_end
 
+    def _validate_no_overlap(self):
+        """Check that no two fields occupy the same bits."""
+        # Build a list of (abs_start_bit, abs_end_bit, name) and check for overlaps
+        intervals = []
+        for name, (width, byte_offset, bit_offset) in self._fields.items():
+            start = byte_offset * 8 + bit_offset
+            end = start + width
+            intervals.append((start, end, name))
+
+        # Sort by start bit and check for overlaps
+        intervals.sort()
+        for i in range(len(intervals) - 1):
+            _, end_a, name_a = intervals[i]
+            start_b, _, name_b = intervals[i + 1]
+            if end_a > start_b:
+                raise ValueError(
+                    f"Fields '{name_a}' and '{name_b}' overlap: "
+                    f"'{name_a}' ends at bit {end_a}, "
+                    f"'{name_b}' starts at bit {start_b}")
+
     @property
     def struct_layout(self):
         """Return a StructLayout for the header fields."""
-        return StructLayout({name: width for name, (width, _) in self._fields.items()})
+        return StructLayout({name: width for name, (width, _, _) in self._fields.items()})
 
     @property
     def byte_length(self):
@@ -111,8 +151,16 @@ class HeaderLayout:
 
     @property
     def fields(self):
-        """The original fields dict."""
+        """The normalised fields dict (3-tuples)."""
         return self._fields
+
+    def abs_bit_offset(self, field_name):
+        """Return the absolute bit position for *field_name*.
+
+        Computed as ``byte_offset * 8 + bit_offset``.
+        """
+        width, byte_offset, bit_offset = self._fields[field_name]
+        return byte_offset * 8 + bit_offset
 
 
 # ===========================================================================
@@ -128,6 +176,11 @@ class Packetizer(wiring.Component):
         Header definition.
     payload_signature : :class:`~amaranth_stream.Signature`
         Stream signature (must have has_first_last=True).
+    packed : :class:`bool`
+        If ``True``, the last header beat is filled with the start of
+        payload data when the header does not perfectly align to the bus
+        width.  Subsequent payload beats are shifted accordingly.
+        Default ``False`` preserves the original behaviour.
 
     Ports
     -----
@@ -139,7 +192,7 @@ class Packetizer(wiring.Component):
         Header fields to insert.
     """
 
-    def __init__(self, header_layout, payload_signature):
+    def __init__(self, header_layout, payload_signature, *, packed=False):
         if not isinstance(payload_signature, StreamSignature):
             raise TypeError(
                 f"Expected amaranth_stream.Signature, got {type(payload_signature).__name__}")
@@ -148,10 +201,12 @@ class Packetizer(wiring.Component):
         self._header_layout = header_layout
         self._payload_sig = payload_signature
         self._payload_width = Shape.cast(payload_signature.payload_shape).width
+        self._packed = packed
 
         # Calculate number of header beats
         header_bits = header_layout.byte_length * 8
         self._header_beats = math.ceil(header_bits / self._payload_width)
+        self._header_bits = header_bits
 
         super().__init__({
             "i_stream": In(payload_signature),
@@ -165,6 +220,7 @@ class Packetizer(wiring.Component):
         payload_width = self._payload_width
         header_beats = self._header_beats
         header_layout = self._header_layout
+        header_bits = self._header_bits
 
         # Latch the header value
         header_latched = Signal(header_layout.byte_length * 8, name="header_latched")
@@ -172,62 +228,190 @@ class Packetizer(wiring.Component):
         # Beat counter for header emission
         beat_cnt = Signal(range(max(header_beats, 1)), name="hdr_beat_cnt")
 
-        with m.FSM(name="packetizer"):
-            with m.State("HEADER"):
-                # Latch header on entry (first beat)
-                with m.If(beat_cnt == 0):
-                    # Pack header fields into a flat bit vector
-                    offset = 0
-                    for name, (width, byte_off) in header_layout.fields.items():
-                        m.d.sync += header_latched[byte_off * 8:byte_off * 8 + width].eq(
-                            getattr(self.header, name))
-                        offset += width
+        if not self._packed or (header_bits % payload_width == 0):
+            # ---- Original (non-packed) behaviour ----
+            with m.FSM(name="packetizer"):
+                with m.State("HEADER"):
+                    # Latch header on entry (first beat)
+                    with m.If(beat_cnt == 0):
+                        # Pack header fields into a flat bit vector
+                        offset = 0
+                        for name, (width, byte_off, bit_off) in header_layout.fields.items():
+                            abs_bit = byte_off * 8 + bit_off
+                            m.d.sync += header_latched[abs_bit:abs_bit + width].eq(
+                                getattr(self.header, name))
+                            offset += width
 
-                # Emit header beats from latched value
-                # For the first beat, use the header port directly (latched not ready yet)
-                with m.If(beat_cnt == 0):
-                    # Build header bits directly from input
-                    header_flat = Signal(header_layout.byte_length * 8, name="header_flat")
-                    offset = 0
-                    for name, (width, byte_off) in header_layout.fields.items():
-                        m.d.comb += header_flat[byte_off * 8:byte_off * 8 + width].eq(
-                            getattr(self.header, name))
-                    m.d.comb += self.o_stream.payload.eq(
-                        header_flat[0:payload_width])
-                with m.Else():
-                    # Subsequent beats from latched value
-                    start_bit = beat_cnt * payload_width
-                    m.d.comb += self.o_stream.payload.eq(
-                        header_latched.word_select(beat_cnt, payload_width))
-
-                m.d.comb += [
-                    self.o_stream.valid.eq(1),
-                    self.o_stream.first.eq(beat_cnt == 0),
-                    self.o_stream.last.eq(0),
-                    self.i_stream.ready.eq(0),  # Don't consume payload during header
-                ]
-
-                # Advance on transfer
-                with m.If(self.o_stream.valid & self.o_stream.ready):
-                    with m.If(beat_cnt == header_beats - 1):
-                        m.d.sync += beat_cnt.eq(0)
-                        m.next = "PAYLOAD"
+                    # Emit header beats from latched value
+                    # For the first beat, use the header port directly (latched not ready yet)
+                    with m.If(beat_cnt == 0):
+                        # Build header bits directly from input
+                        header_flat = Signal(header_bits, name="header_flat")
+                        offset = 0
+                        for name, (width, byte_off, bit_off) in header_layout.fields.items():
+                            abs_bit = byte_off * 8 + bit_off
+                            m.d.comb += header_flat[abs_bit:abs_bit + width].eq(
+                                getattr(self.header, name))
+                        m.d.comb += self.o_stream.payload.eq(
+                            header_flat[0:payload_width])
                     with m.Else():
-                        m.d.sync += beat_cnt.eq(beat_cnt + 1)
+                        # Subsequent beats from latched value
+                        m.d.comb += self.o_stream.payload.eq(
+                            header_latched.word_select(beat_cnt, payload_width))
 
-            with m.State("PAYLOAD"):
-                # Pass through payload beats
-                m.d.comb += [
-                    self.o_stream.payload.eq(self.i_stream.payload),
-                    self.o_stream.valid.eq(self.i_stream.valid),
-                    self.o_stream.first.eq(0),
-                    self.o_stream.last.eq(self.i_stream.last),
-                    self.i_stream.ready.eq(self.o_stream.ready),
-                ]
+                    m.d.comb += [
+                        self.o_stream.valid.eq(1),
+                        self.o_stream.first.eq(beat_cnt == 0),
+                        self.o_stream.last.eq(0),
+                        self.i_stream.ready.eq(0),  # Don't consume payload during header
+                    ]
 
-                # On last beat, go back to HEADER
-                with m.If(self.i_stream.valid & self.i_stream.ready & self.i_stream.last):
-                    m.next = "HEADER"
+                    # Advance on transfer
+                    with m.If(self.o_stream.valid & self.o_stream.ready):
+                        with m.If(beat_cnt == header_beats - 1):
+                            m.d.sync += beat_cnt.eq(0)
+                            m.next = "PAYLOAD"
+                        with m.Else():
+                            m.d.sync += beat_cnt.eq(beat_cnt + 1)
+
+                with m.State("PAYLOAD"):
+                    # Pass through payload beats
+                    m.d.comb += [
+                        self.o_stream.payload.eq(self.i_stream.payload),
+                        self.o_stream.valid.eq(self.i_stream.valid),
+                        self.o_stream.first.eq(0),
+                        self.o_stream.last.eq(self.i_stream.last),
+                        self.i_stream.ready.eq(self.o_stream.ready),
+                    ]
+
+                    # On last beat, go back to HEADER
+                    with m.If(self.i_stream.valid & self.i_stream.ready & self.i_stream.last):
+                        m.next = "HEADER"
+        else:
+            # ---- Packed mode: merge tail of header with start of payload ----
+            remainder = header_bits % payload_width   # header bits in last header beat
+            pack_bits = payload_width - remainder      # payload bits packed into last header beat
+
+            # Carry register: holds the upper bits of the previous payload beat
+            # that couldn't fit into the current output beat.
+            carry = Signal(remainder, name="carry")
+
+            # Number of full header beats (those that are 100% header)
+            full_hdr_beats = header_beats - 1  # last header beat is the packed one
+
+            # Build a flat header signal from the input ports (for beat 0)
+            header_flat = Signal(header_bits, name="header_flat_p")
+            for name, (width, byte_off, bit_off) in header_layout.fields.items():
+                abs_bit = byte_off * 8 + bit_off
+                m.d.comb += header_flat[abs_bit:abs_bit + width].eq(
+                    getattr(self.header, name))
+
+            init_state = "HEADER" if full_hdr_beats > 0 else "PACK"
+
+            with m.FSM(name="packetizer", init=init_state):
+                if full_hdr_beats > 0:
+                    with m.State("HEADER"):
+                        # Latch header on entry (first beat)
+                        with m.If(beat_cnt == 0):
+                            for name, (width, byte_off, bit_off) in header_layout.fields.items():
+                                abs_bit = byte_off * 8 + bit_off
+                                m.d.sync += header_latched[abs_bit:abs_bit + width].eq(
+                                    getattr(self.header, name))
+
+                        # Emit full header beats
+                        with m.If(beat_cnt == 0):
+                            m.d.comb += self.o_stream.payload.eq(
+                                header_flat[0:payload_width])
+                        with m.Else():
+                            m.d.comb += self.o_stream.payload.eq(
+                                header_latched.word_select(beat_cnt, payload_width))
+
+                        m.d.comb += [
+                            self.o_stream.valid.eq(1),
+                            self.o_stream.first.eq(beat_cnt == 0),
+                            self.o_stream.last.eq(0),
+                            self.i_stream.ready.eq(0),
+                        ]
+
+                        with m.If(self.o_stream.valid & self.o_stream.ready):
+                            with m.If(beat_cnt == full_hdr_beats - 1):
+                                m.d.sync += beat_cnt.eq(0)
+                                m.next = "PACK"
+                            with m.Else():
+                                m.d.sync += beat_cnt.eq(beat_cnt + 1)
+
+                with m.State("PACK"):
+                    # Last header beat: lower `remainder` bits = header tail,
+                    # upper `pack_bits` bits = start of payload.
+                    # We need to consume from i_stream here.
+                    hdr_tail = Signal(remainder, name="hdr_tail")
+                    if full_hdr_beats > 0:
+                        m.d.comb += hdr_tail.eq(
+                            header_latched[full_hdr_beats * payload_width:
+                                           full_hdr_beats * payload_width + remainder])
+                    else:
+                        # No full header beats — use header_flat directly
+                        m.d.comb += hdr_tail.eq(header_flat[:remainder])
+                        # Also latch header for potential future use
+                        for name, (width, byte_off, bit_off) in header_layout.fields.items():
+                            abs_bit = byte_off * 8 + bit_off
+                            m.d.sync += header_latched[abs_bit:abs_bit + width].eq(
+                                getattr(self.header, name))
+
+                    m.d.comb += [
+                        self.o_stream.payload[:remainder].eq(hdr_tail),
+                        self.o_stream.payload[remainder:].eq(
+                            self.i_stream.payload[:pack_bits]),
+                        self.o_stream.valid.eq(self.i_stream.valid),
+                        self.o_stream.first.eq(1 if full_hdr_beats == 0 else 0),
+                        self.o_stream.last.eq(0),  # Never last — carry still needs flushing
+                        self.i_stream.ready.eq(self.o_stream.ready),
+                    ]
+
+                    with m.If(self.i_stream.valid & self.i_stream.ready):
+                        # Store the upper bits of this payload beat as carry
+                        m.d.sync += carry.eq(
+                            self.i_stream.payload[pack_bits:])
+                        with m.If(self.i_stream.last):
+                            # Payload ended — flush carry in DRAIN
+                            m.next = "DRAIN"
+                        with m.Else():
+                            m.next = "PAYLOAD"
+
+                with m.State("PAYLOAD"):
+                    # Each output beat: lower `remainder` bits from carry,
+                    # upper `pack_bits` bits from current input payload.
+                    m.d.comb += [
+                        self.o_stream.payload[:remainder].eq(carry),
+                        self.o_stream.payload[remainder:].eq(
+                            self.i_stream.payload[:pack_bits]),
+                        self.o_stream.valid.eq(self.i_stream.valid),
+                        self.o_stream.first.eq(0),
+                        self.o_stream.last.eq(0),  # Never last — carry still needs flushing
+                        self.i_stream.ready.eq(self.o_stream.ready),
+                    ]
+
+                    with m.If(self.i_stream.valid & self.i_stream.ready):
+                        m.d.sync += carry.eq(
+                            self.i_stream.payload[pack_bits:])
+                        with m.If(self.i_stream.last):
+                            # Payload ended — flush carry in DRAIN
+                            m.next = "DRAIN"
+
+                with m.State("DRAIN"):
+                    # Emit the final partial beat with carry data in the lower
+                    # bits.  Upper bits are zero-padded.
+                    m.d.comb += [
+                        self.o_stream.payload[:remainder].eq(carry),
+                        self.o_stream.payload[remainder:].eq(0),
+                        self.o_stream.valid.eq(1),
+                        self.o_stream.first.eq(0),
+                        self.o_stream.last.eq(1),
+                    ]
+                    m.d.comb += self.i_stream.ready.eq(0)
+
+                    with m.If(self.o_stream.valid & self.o_stream.ready):
+                        m.next = init_state
 
         return m
 
@@ -245,6 +429,11 @@ class Depacketizer(wiring.Component):
         Header definition.
     payload_signature : :class:`~amaranth_stream.Signature`
         Stream signature.
+    packed : :class:`bool`
+        If ``True``, the last header beat contains packed payload data
+        that must be extracted and realigned.  Must match the ``packed``
+        setting used by the corresponding :class:`Packetizer`.
+        Default ``False`` preserves the original behaviour.
 
     Ports
     -----
@@ -256,7 +445,7 @@ class Depacketizer(wiring.Component):
         Extracted header fields.
     """
 
-    def __init__(self, header_layout, payload_signature):
+    def __init__(self, header_layout, payload_signature, *, packed=False):
         if not isinstance(payload_signature, StreamSignature):
             raise TypeError(
                 f"Expected amaranth_stream.Signature, got {type(payload_signature).__name__}")
@@ -265,9 +454,11 @@ class Depacketizer(wiring.Component):
         self._header_layout = header_layout
         self._payload_sig = payload_signature
         self._payload_width = Shape.cast(payload_signature.payload_shape).width
+        self._packed = packed
 
         header_bits = header_layout.byte_length * 8
         self._header_beats = math.ceil(header_bits / self._payload_width)
+        self._header_bits = header_bits
 
         super().__init__({
             "i_stream": In(payload_signature),
@@ -281,6 +472,7 @@ class Depacketizer(wiring.Component):
         payload_width = self._payload_width
         header_beats = self._header_beats
         header_layout = self._header_layout
+        header_bits = self._header_bits
 
         # Storage for header bits
         header_store = Signal(header_layout.byte_length * 8, name="header_store")
@@ -291,47 +483,144 @@ class Depacketizer(wiring.Component):
         # Track if this is the first payload beat after header
         first_payload = Signal(1, name="first_payload")
 
-        with m.FSM(name="depacketizer"):
-            with m.State("HEADER"):
-                m.d.comb += [
-                    self.i_stream.ready.eq(1),  # Consume header beats
-                    self.o_stream.valid.eq(0),   # Don't output during header
-                ]
+        if not self._packed or (header_bits % payload_width == 0):
+            # ---- Original (non-packed) behaviour ----
+            with m.FSM(name="depacketizer"):
+                with m.State("HEADER"):
+                    m.d.comb += [
+                        self.i_stream.ready.eq(1),  # Consume header beats
+                        self.o_stream.valid.eq(0),   # Don't output during header
+                    ]
 
-                with m.If(self.i_stream.valid & self.i_stream.ready):
-                    # Store header beat
-                    m.d.sync += header_store.word_select(beat_cnt, payload_width).eq(
-                        self.i_stream.payload)
+                    with m.If(self.i_stream.valid & self.i_stream.ready):
+                        # Store header beat
+                        m.d.sync += header_store.word_select(beat_cnt, payload_width).eq(
+                            self.i_stream.payload)
 
-                    with m.If(beat_cnt == header_beats - 1):
-                        m.d.sync += [
-                            beat_cnt.eq(0),
-                            first_payload.eq(1),
+                        with m.If(beat_cnt == header_beats - 1):
+                            m.d.sync += [
+                                beat_cnt.eq(0),
+                                first_payload.eq(1),
+                            ]
+                            m.next = "PAYLOAD"
+                        with m.Else():
+                            m.d.sync += beat_cnt.eq(beat_cnt + 1)
+
+                with m.State("PAYLOAD"):
+                    # Pass through payload beats
+                    m.d.comb += [
+                        self.o_stream.payload.eq(self.i_stream.payload),
+                        self.o_stream.valid.eq(self.i_stream.valid),
+                        self.o_stream.first.eq(first_payload),
+                        self.o_stream.last.eq(self.i_stream.last),
+                        self.i_stream.ready.eq(self.o_stream.ready),
+                    ]
+
+                    with m.If(self.i_stream.valid & self.i_stream.ready):
+                        m.d.sync += first_payload.eq(0)
+
+                        with m.If(self.i_stream.last):
+                            m.next = "HEADER"
+        else:
+            # ---- Packed mode: extract payload from packed header beat ----
+            remainder = header_bits % payload_width   # header bits in last header beat
+            pack_bits = payload_width - remainder      # payload bits packed into last header beat
+
+            # Number of full header beats (100% header)
+            full_hdr_beats = header_beats - 1
+
+            # Carry register: holds payload bits extracted from the packed beat
+            # or the upper bits of the previous payload beat.
+            # Width is pack_bits because that's how many payload bits we extract
+            # from each input beat.
+            carry = Signal(pack_bits, name="carry")
+
+            init_state = "HEADER" if full_hdr_beats > 0 else "UNPACK"
+
+            with m.FSM(name="depacketizer", init=init_state):
+                if full_hdr_beats > 0:
+                    with m.State("HEADER"):
+                        m.d.comb += [
+                            self.i_stream.ready.eq(1),
+                            self.o_stream.valid.eq(0),
                         ]
+
+                        with m.If(self.i_stream.valid & self.i_stream.ready):
+                            # Store full header beats
+                            m.d.sync += header_store.word_select(beat_cnt, payload_width).eq(
+                                self.i_stream.payload)
+
+                            with m.If(beat_cnt == full_hdr_beats - 1):
+                                m.d.sync += beat_cnt.eq(0)
+                                m.next = "UNPACK"
+                            with m.Else():
+                                m.d.sync += beat_cnt.eq(beat_cnt + 1)
+
+                with m.State("UNPACK"):
+                    # Packed header beat: lower `remainder` bits = header tail,
+                    # upper `pack_bits` bits = start of payload.
+                    # Consume this beat, store header tail and payload carry.
+                    m.d.comb += [
+                        self.i_stream.ready.eq(1),
+                        self.o_stream.valid.eq(0),
+                    ]
+
+                    with m.If(self.i_stream.valid & self.i_stream.ready):
+                        # Store header tail bits
+                        m.d.sync += header_store[
+                            full_hdr_beats * payload_width:
+                            full_hdr_beats * payload_width + remainder
+                        ].eq(self.i_stream.payload[:remainder])
+                        # Store payload bits as carry (upper pack_bits of this beat)
+                        m.d.sync += carry.eq(
+                            self.i_stream.payload[remainder:remainder + pack_bits])
+                        m.d.sync += first_payload.eq(1)
+                        # If last is asserted on the packed beat, there's no more
+                        # payload data — but this shouldn't happen in normal use
+                        # since the packetizer always emits at least a DRAIN beat.
                         m.next = "PAYLOAD"
-                    with m.Else():
-                        m.d.sync += beat_cnt.eq(beat_cnt + 1)
 
-            with m.State("PAYLOAD"):
-                # Pass through payload beats
-                m.d.comb += [
-                    self.o_stream.payload.eq(self.i_stream.payload),
-                    self.o_stream.valid.eq(self.i_stream.valid),
-                    self.o_stream.first.eq(first_payload),
-                    self.o_stream.last.eq(self.i_stream.last),
-                    self.i_stream.ready.eq(self.o_stream.ready),
-                ]
+                with m.State("PAYLOAD"):
+                    # Reconstruct original payload from shifted data.
+                    #
+                    # Packetizer output format:
+                    #   PACK beat:    [hdr_tail(remainder bits) | orig_payload[0:pack_bits]]
+                    #   PAYLOAD beat: [prev_carry(remainder bits) | orig_payload[0:pack_bits]]
+                    #   DRAIN beat:   [prev_carry(remainder bits) | zeros(pack_bits)]
+                    #
+                    # Where prev_carry = previous_orig_payload[pack_bits:payload_width]
+                    #
+                    # Depacketizer carry (pack_bits wide) holds the lower portion
+                    # of the original payload beat.  The upper portion comes from
+                    # the lower `remainder` bits of the current input beat.
+                    #
+                    # output = Cat(carry, input[0:remainder])
+                    #        = pack_bits + remainder = payload_width  ✓
+                    # new_carry = input[remainder:payload_width]  (pack_bits wide)
 
-                with m.If(self.i_stream.valid & self.i_stream.ready):
-                    m.d.sync += first_payload.eq(0)
+                    m.d.comb += [
+                        self.o_stream.payload.eq(
+                            Cat(carry, self.i_stream.payload[:remainder])),
+                        self.o_stream.valid.eq(self.i_stream.valid),
+                        self.o_stream.first.eq(first_payload),
+                        self.o_stream.last.eq(self.i_stream.last),
+                        self.i_stream.ready.eq(self.o_stream.ready),
+                    ]
 
-                    with m.If(self.i_stream.last):
-                        m.next = "HEADER"
+                    with m.If(self.i_stream.valid & self.i_stream.ready):
+                        m.d.sync += first_payload.eq(0)
+                        # Update carry with the upper pack_bits of this input beat
+                        m.d.sync += carry.eq(
+                            self.i_stream.payload[remainder:])
+
+                        with m.If(self.i_stream.last):
+                            m.next = init_state
 
         # Extract header fields from stored bits
-        for name, (width, byte_off) in header_layout.fields.items():
+        for name, (width, byte_off, bit_off) in header_layout.fields.items():
+            abs_bit = byte_off * 8 + bit_off
             m.d.comb += getattr(self.header, name).eq(
-                header_store[byte_off * 8:byte_off * 8 + width])
+                header_store[abs_bit:abs_bit + width])
 
         return m
 
@@ -351,6 +640,11 @@ class PacketFIFO(wiring.Component):
         Max payload beats.
     packet_depth : :class:`int`
         Max buffered packets (default 16).
+    has_abort : :class:`bool`
+        If ``True``, add an ``abort`` input signal that discards the
+        current in-progress packet and resets the write pointer to the
+        start of that packet.  Previously committed packets are not
+        affected.  Default ``False``.
 
     Ports
     -----
@@ -360,9 +654,12 @@ class PacketFIFO(wiring.Component):
         Output stream.
     packet_count : Out(range(packet_depth + 1))
         Number of complete packets available.
+    abort : In(1)
+        Assert mid-packet to discard the current packet (only present
+        when ``has_abort=True``).
     """
 
-    def __init__(self, signature, payload_depth, packet_depth=16):
+    def __init__(self, signature, payload_depth, packet_depth=16, *, has_abort=False):
         if not isinstance(signature, StreamSignature):
             raise TypeError(
                 f"Expected amaranth_stream.Signature, got {type(signature).__name__}")
@@ -371,12 +668,17 @@ class PacketFIFO(wiring.Component):
         self._stream_sig = signature
         self._payload_depth = payload_depth
         self._packet_depth = packet_depth
+        self._has_abort = has_abort
 
-        super().__init__({
+        ports = {
             "i_stream": In(signature),
             "o_stream": Out(signature),
             "packet_count": Out(range(packet_depth + 1)),
-        })
+        }
+        if has_abort:
+            ports["abort"] = In(1)
+
+        super().__init__(ports)
 
     def elaborate(self, platform):
         m = Module()
@@ -384,6 +686,13 @@ class PacketFIFO(wiring.Component):
         sig = self._stream_sig
         total_width, fields = _stream_data_width(sig)
 
+        if not self._has_abort:
+            return self._elaborate_standard(m, sig, total_width, fields)
+        else:
+            return self._elaborate_with_abort(m, sig, total_width, fields)
+
+    def _elaborate_standard(self, m, sig, total_width, fields):
+        """Original PacketFIFO implementation (no abort support)."""
         # Data FIFO: stores packed stream data
         data_fifo = SyncFIFO(width=total_width, depth=self._payload_depth)
         m.submodules.data_fifo = data_fifo
@@ -463,6 +772,179 @@ class PacketFIFO(wiring.Component):
         with m.Else():
             # Currently reading a packet
             with m.If(r_transfer):
+                with m.If(rd_beat_cnt == rd_pkt_len - 1):
+                    # Finished this packet
+                    m.d.sync += reading.eq(0)
+                with m.Else():
+                    m.d.sync += rd_beat_cnt.eq(rd_beat_cnt + 1)
+
+        # Packet count
+        m.d.comb += self.packet_count.eq(pkt_fifo.level)
+
+        return m
+
+    def _elaborate_with_abort(self, m, sig, total_width, fields):
+        """PacketFIFO with abort support using manual memory management."""
+        from amaranth.lib.memory import Memory
+
+        depth = self._payload_depth
+        addr_width = max(1, (depth - 1).bit_length())
+
+        # --- Data memory (replaces SyncFIFO for data) ---
+        data_mem = Memory(shape=unsigned(total_width), depth=depth, init=[])
+        m.submodules.data_mem = data_mem
+        wr_port = data_mem.write_port()
+        rd_port = data_mem.read_port(domain="comb")
+
+        # Packet length FIFO: stores beat counts for complete packets
+        len_width = max(1, (self._payload_depth).bit_length())
+        pkt_fifo = SyncFIFO(width=len_width, depth=self._packet_depth)
+        m.submodules.pkt_fifo = pkt_fifo
+
+        # --- Write pointers ---
+        # wr_ptr: current write position (advances with each beat)
+        # commit_ptr: position at start of current packet (restored on abort)
+        # rd_ptr: current read position
+        wr_ptr = Signal(addr_width, name="wr_ptr")
+        commit_ptr = Signal(addr_width, name="commit_ptr")
+        rd_ptr = Signal(addr_width, name="rd_ptr")
+
+        # Level tracking: number of committed beats in the buffer
+        # (committed means the packet has been fully written and committed)
+        committed_level = Signal(range(depth + 1), name="committed_level")
+
+        # --- Write side ---
+        pack_signals = []
+        for name, _width in fields:
+            pack_signals.append(getattr(self.i_stream, name))
+
+        # Beat counter for current packet being written
+        wr_beat_cnt = Signal(range(self._payload_depth + 1), name="wr_beat_cnt")
+
+        # Calculate available space: depth - (wr_ptr - rd_ptr) mod depth
+        # We use the full/empty distinction via a level counter
+        wr_level = Signal(range(depth + 1), name="wr_level")
+        # wr_level tracks total beats written (committed + uncommitted)
+        w_rdy = Signal(name="w_rdy")
+        m.d.comb += w_rdy.eq(wr_level < depth)
+
+        w_transfer = Signal(name="w_transfer")
+        m.d.comb += w_transfer.eq(self.i_stream.valid & self.i_stream.ready)
+
+        # Write port connections
+        m.d.comb += [
+            wr_port.addr.eq(wr_ptr),
+            wr_port.data.eq(Cat(*pack_signals)),
+            wr_port.en.eq(w_transfer),
+        ]
+
+        # Accept input when buffer has space
+        m.d.comb += self.i_stream.ready.eq(w_rdy)
+
+        # Track beats, commit packets, handle abort
+        with m.If(self.abort):
+            # Abort: roll back write pointer to commit_ptr
+            m.d.sync += [
+                wr_ptr.eq(commit_ptr),
+                wr_beat_cnt.eq(0),
+                wr_level.eq(committed_level),
+            ]
+        with m.Elif(w_transfer):
+            # Advance write pointer
+            with m.If(wr_ptr == depth - 1):
+                m.d.sync += wr_ptr.eq(0)
+            with m.Else():
+                m.d.sync += wr_ptr.eq(wr_ptr + 1)
+
+            m.d.sync += wr_beat_cnt.eq(wr_beat_cnt + 1)
+
+            with m.If(self.i_stream.last):
+                # Commit: update commit_ptr and write beat count to pkt FIFO
+                # commit_ptr = wr_ptr + 1 (next position after last beat)
+                with m.If(wr_ptr == depth - 1):
+                    m.d.sync += commit_ptr.eq(0)
+                with m.Else():
+                    m.d.sync += commit_ptr.eq(wr_ptr + 1)
+
+                m.d.comb += [
+                    pkt_fifo.w_data.eq(wr_beat_cnt + 1),
+                    pkt_fifo.w_en.eq(1),
+                ]
+                m.d.sync += [
+                    wr_beat_cnt.eq(0),
+                    committed_level.eq(committed_level + wr_beat_cnt + 1),
+                ]
+
+        # Update wr_level: tracks total used slots (committed + uncommitted)
+        # On write (non-abort): wr_level += 1
+        # On read: wr_level -= 1 (and committed_level -= 1)
+        # On abort: wr_level is reset to committed_level (handled above)
+        r_transfer = Signal(name="r_transfer")
+
+        with m.If(~self.abort):
+            with m.If(w_transfer & ~r_transfer):
+                m.d.sync += wr_level.eq(wr_level + 1)
+            with m.Elif(~w_transfer & r_transfer):
+                m.d.sync += wr_level.eq(wr_level - 1)
+            # If both, wr_level stays the same
+
+        # Also update committed_level on read
+        with m.If(r_transfer):
+            # If we're also committing in the same cycle, net effect is
+            # committed_level += (wr_beat_cnt + 1) - 1 = wr_beat_cnt
+            # But the commit case above already sets committed_level,
+            # so we handle the read decrement separately.
+            # We need to be careful about simultaneous commit + read.
+            with m.If(w_transfer & self.i_stream.last):
+                # Simultaneous commit and read: committed_level += (pkt_len - 1)
+                m.d.sync += committed_level.eq(
+                    committed_level + wr_beat_cnt + 1 - 1)
+            with m.Else():
+                m.d.sync += committed_level.eq(committed_level - 1)
+
+        # --- Read side ---
+        rd_beat_cnt = Signal(range(self._payload_depth + 1), name="rd_beat_cnt")
+        rd_pkt_len = Signal(len_width, name="rd_pkt_len")
+        reading = Signal(name="reading")
+
+        # Read port connections
+        m.d.comb += rd_port.addr.eq(rd_ptr)
+
+        # Unpack data from memory read port
+        offset = 0
+        for name, width in fields:
+            m.d.comb += getattr(self.o_stream, name).eq(rd_port.data[offset:offset + width])
+            offset += width
+
+        # Output valid only when we have a packet to read
+        m.d.comb += self.o_stream.valid.eq(reading)
+
+        # Override first/last with our own framing
+        m.d.comb += [
+            self.o_stream.first.eq(reading & (rd_beat_cnt == 0)),
+            self.o_stream.last.eq(reading & (rd_beat_cnt == rd_pkt_len - 1)),
+        ]
+
+        m.d.comb += r_transfer.eq(self.o_stream.valid & self.o_stream.ready)
+
+        with m.If(~reading):
+            # Not currently reading — check if a packet is available
+            with m.If(pkt_fifo.r_rdy):
+                m.d.sync += [
+                    rd_pkt_len.eq(pkt_fifo.r_data),
+                    rd_beat_cnt.eq(0),
+                    reading.eq(1),
+                ]
+                m.d.comb += pkt_fifo.r_en.eq(1)
+        with m.Else():
+            # Currently reading a packet
+            with m.If(r_transfer):
+                # Advance read pointer
+                with m.If(rd_ptr == depth - 1):
+                    m.d.sync += rd_ptr.eq(0)
+                with m.Else():
+                    m.d.sync += rd_ptr.eq(rd_ptr + 1)
+
                 with m.If(rd_beat_cnt == rd_pkt_len - 1):
                     # Finished this packet
                     m.d.sync += reading.eq(0)

@@ -13,7 +13,7 @@ from amaranth.lib import wiring
 from amaranth.lib.wiring import In, Out
 
 
-__all__ = ["Signature", "Interface", "core_to_extended"]
+__all__ = ["Signature", "Interface", "core_to_extended", "connect_streams"]
 
 
 class Signature(wiring.Signature):
@@ -231,3 +231,71 @@ def core_to_extended(core_sig):
         always_valid=core_sig.always_valid,
         always_ready=core_sig.always_ready,
     )
+
+
+def connect_streams(m, src, dst, *, exclude=None):
+    """Connect two stream interfaces combinationally.
+
+    Wires ``src`` (source / initiator) to ``dst`` (destination / target),
+    connecting handshake signals, payload, and any optional members that
+    both interfaces share.
+
+    Parameters
+    ----------
+    m : :class:`~amaranth.hdl.Module`
+        The module to add combinational statements to.
+    src : stream interface
+        Source stream (drives ``payload``, ``valid``, and forward sideband
+        signals).
+    dst : stream interface
+        Destination stream (drives ``ready``).
+    exclude : set of str or None
+        Optional set of member names to skip when connecting.  For example,
+        ``exclude={"param"}`` will leave the ``param`` member unconnected.
+
+    Notes
+    -----
+    Only members present on **both** ``src`` and ``dst`` are connected.
+    If one side has ``first``/``last`` but the other does not, those signals
+    are silently skipped.  The ``exclude`` parameter can be used to
+    suppress connection of any member by name.
+    """
+    if exclude is None:
+        exclude = set()
+
+    # Determine which members exist on each side by inspecting the
+    # underlying Signature.  We accept both Interface objects (which
+    # have a .signature attribute) and FlippedInterface / plain objects
+    # that expose the same attribute names.
+    def _sig(intf):
+        sig = getattr(intf, "signature", None)
+        if sig is None:
+            return None
+        # Unwrap FlippedSignature if needed
+        from amaranth.lib.wiring import FlippedSignature
+        if isinstance(sig, FlippedSignature):
+            return sig.flip()
+        return sig
+
+    src_sig = _sig(src)
+    dst_sig = _sig(dst)
+
+    # --- Handshake (always connected) ---
+    if "valid" not in exclude:
+        m.d.comb += dst.valid.eq(src.valid)
+    if "ready" not in exclude:
+        m.d.comb += src.ready.eq(dst.ready)
+
+    # --- Payload ---
+    if "payload" not in exclude:
+        m.d.comb += dst.payload.eq(src.payload)
+
+    # --- Optional forward members ---
+    optional_members = ("first", "last", "param", "keep")
+    for name in optional_members:
+        if name in exclude:
+            continue
+        src_has = hasattr(src, name) and (src_sig is None or name in src_sig.members)
+        dst_has = hasattr(dst, name) and (dst_sig is None or name in dst_sig.members)
+        if src_has and dst_has:
+            m.d.comb += getattr(dst, name).eq(getattr(src, name))

@@ -355,3 +355,247 @@ class TestAXIRoundtrip:
         # At least the first values should match (combinational path)
         for sent, received in zip(data_sent, data_received):
             assert sent == received
+
+
+# ---------------------------------------------------------------------------
+# tfirst support tests
+# ---------------------------------------------------------------------------
+
+class TestAXIStreamSignatureTfirst:
+    """Test AXIStreamSignature with has_tfirst parameter."""
+
+    def test_axi_stream_signature_tfirst(self):
+        """Signature with has_tfirst=True includes tfirst member."""
+        sig = AXIStreamSignature(32, has_tfirst=True)
+        assert sig.has_tfirst is True
+        assert "tfirst" in sig.members
+        assert "tlast" in sig.members
+        assert "tdata" in sig.members
+
+    def test_axi_stream_tfirst_backward_compat(self):
+        """Default has_tfirst=False works exactly as before — no tfirst member."""
+        sig = AXIStreamSignature(32)
+        assert sig.has_tfirst is False
+        assert "tfirst" not in sig.members
+        # All standard members still present
+        assert "tdata" in sig.members
+        assert "tvalid" in sig.members
+        assert "tready" in sig.members
+        assert "tkeep" in sig.members
+        assert "tstrb" in sig.members
+        assert "tlast" in sig.members
+
+    def test_axi_stream_signature_tfirst_equality(self):
+        """Signatures with different has_tfirst are not equal."""
+        sig_with = AXIStreamSignature(32, has_tfirst=True)
+        sig_without = AXIStreamSignature(32, has_tfirst=False)
+        assert sig_with != sig_without
+        assert sig_with == AXIStreamSignature(32, has_tfirst=True)
+
+    def test_axi_stream_signature_tfirst_repr(self):
+        """repr includes has_tfirst when True."""
+        sig = AXIStreamSignature(32, has_tfirst=True)
+        assert "has_tfirst=True" in repr(sig)
+        sig2 = AXIStreamSignature(32)
+        assert "has_tfirst" not in repr(sig2)
+
+
+class _AXIToStreamTfirstHarness(wiring.Component):
+    """Test harness for AXIStreamToStream with tfirst."""
+
+    def __init__(self, data_width):
+        self._data_width = data_width
+        axi_sig = AXIStreamSignature(data_width, has_tfirst=True)
+        stream_sig = Signature(unsigned(data_width), has_first_last=True, has_keep=True)
+        self._bridge = AXIStreamToStream(axi_sig, stream_sig)
+        super().__init__({
+            "axi": In(axi_sig),
+            "o_stream": Out(stream_sig),
+        })
+
+    def elaborate(self, platform):
+        m = Module()
+        m.domains += ClockDomain("sync")
+        m.submodules.bridge = bridge = self._bridge
+
+        # Connect AXI input (including tfirst)
+        m.d.comb += [
+            bridge.axi.tdata.eq(self.axi.tdata),
+            bridge.axi.tvalid.eq(self.axi.tvalid),
+            self.axi.tready.eq(bridge.axi.tready),
+            bridge.axi.tkeep.eq(self.axi.tkeep),
+            bridge.axi.tstrb.eq(self.axi.tstrb),
+            bridge.axi.tlast.eq(self.axi.tlast),
+            bridge.axi.tfirst.eq(self.axi.tfirst),
+        ]
+
+        # Connect stream output
+        m.d.comb += [
+            self.o_stream.payload.eq(bridge.o_stream.payload),
+            self.o_stream.valid.eq(bridge.o_stream.valid),
+            bridge.o_stream.ready.eq(self.o_stream.ready),
+            self.o_stream.first.eq(bridge.o_stream.first),
+            self.o_stream.last.eq(bridge.o_stream.last),
+            self.o_stream.keep.eq(bridge.o_stream.keep),
+        ]
+
+        return m
+
+
+class TestAXIStreamToStreamWithTfirst:
+    """Test AXIStreamToStream bridge when AXI-Stream has tfirst."""
+
+    def test_axi_stream_to_stream_with_tfirst(self):
+        """Bridge AXI-Stream (with tfirst) to stream — first comes directly from tfirst."""
+        dut = _AXIToStreamTfirstHarness(16)
+        results = []
+
+        async def tb(ctx):
+            # Send a 3-beat packet: tfirst=1 on first beat, 0 on others
+            beats = [
+                (0x1234, 1, 0, 0x3),  # (data, tfirst, tlast, tkeep)
+                (0x5678, 0, 0, 0x3),
+                (0x9ABC, 0, 1, 0x3),
+            ]
+            for data, tfirst, tlast, tkeep in beats:
+                ctx.set(dut.axi.tdata, data)
+                ctx.set(dut.axi.tvalid, 1)
+                ctx.set(dut.axi.tfirst, tfirst)
+                ctx.set(dut.axi.tlast, tlast)
+                ctx.set(dut.axi.tkeep, tkeep)
+                ctx.set(dut.o_stream.ready, 1)
+                _, _, payload, valid, first, last_val, keep = await ctx.tick().sample(
+                    dut.o_stream.payload, dut.o_stream.valid,
+                    dut.o_stream.first, dut.o_stream.last,
+                    dut.o_stream.keep)
+                if valid:
+                    results.append({
+                        "payload": payload,
+                        "first": first,
+                        "last": last_val,
+                        "keep": keep,
+                    })
+
+            # One more tick to capture the last beat
+            ctx.set(dut.axi.tvalid, 0)
+            _, _, payload, valid, first, last_val, keep = await ctx.tick().sample(
+                dut.o_stream.payload, dut.o_stream.valid,
+                dut.o_stream.first, dut.o_stream.last,
+                dut.o_stream.keep)
+            if valid:
+                results.append({
+                    "payload": payload,
+                    "first": first,
+                    "last": last_val,
+                    "keep": keep,
+                })
+
+        _run_sim(dut, tb, vcd_name="test_axi_to_stream_tfirst.vcd")
+
+        # Verify: first should directly reflect tfirst (combinational),
+        # so first beat has first=1, subsequent beats have first=0
+        assert len(results) >= 2
+        assert results[0]["first"] == 1, f"First beat should have first=1, got {results[0]}"
+        for r in results[1:]:
+            assert r["first"] == 0, f"Non-first beat should have first=0, got {r}"
+
+
+class _StreamToAXITfirstHarness(wiring.Component):
+    """Test harness for StreamToAXIStream with tfirst."""
+
+    def __init__(self, data_width):
+        self._data_width = data_width
+        stream_sig = Signature(unsigned(data_width), has_first_last=True, has_keep=True)
+        axi_sig = AXIStreamSignature(data_width, has_tfirst=True)
+        self._bridge = StreamToAXIStream(stream_sig, axi_sig)
+        super().__init__({
+            "i_stream": In(stream_sig),
+            "axi": Out(axi_sig),
+        })
+
+    def elaborate(self, platform):
+        m = Module()
+        m.domains += ClockDomain("sync")
+        m.submodules.bridge = bridge = self._bridge
+
+        # Connect stream input
+        m.d.comb += [
+            bridge.i_stream.payload.eq(self.i_stream.payload),
+            bridge.i_stream.valid.eq(self.i_stream.valid),
+            self.i_stream.ready.eq(bridge.i_stream.ready),
+            bridge.i_stream.first.eq(self.i_stream.first),
+            bridge.i_stream.last.eq(self.i_stream.last),
+            bridge.i_stream.keep.eq(self.i_stream.keep),
+        ]
+
+        # Connect AXI output (including tfirst)
+        m.d.comb += [
+            self.axi.tdata.eq(bridge.axi.tdata),
+            self.axi.tvalid.eq(bridge.axi.tvalid),
+            bridge.axi.tready.eq(self.axi.tready),
+            self.axi.tkeep.eq(bridge.axi.tkeep),
+            self.axi.tstrb.eq(bridge.axi.tstrb),
+            self.axi.tlast.eq(bridge.axi.tlast),
+            self.axi.tfirst.eq(bridge.axi.tfirst),
+        ]
+
+        return m
+
+
+class TestStreamToAXIStreamWithTfirst:
+    """Test StreamToAXIStream bridge when AXI-Stream has tfirst."""
+
+    def test_stream_to_axi_stream_with_tfirst(self):
+        """Bridge stream to AXI-Stream (with tfirst) — tfirst is driven from first."""
+        dut = _StreamToAXITfirstHarness(16)
+        results = []
+
+        async def tb(ctx):
+            # Send beats via stream interface with first signal
+            beats = [
+                (0x1234, 1, 0, 0x3),  # (data, first, last, keep)
+                (0x5678, 0, 0, 0x3),
+                (0x9ABC, 0, 1, 0x3),
+            ]
+            for data, first, last, keep in beats:
+                ctx.set(dut.i_stream.payload, data)
+                ctx.set(dut.i_stream.valid, 1)
+                ctx.set(dut.i_stream.first, first)
+                ctx.set(dut.i_stream.last, last)
+                ctx.set(dut.i_stream.keep, keep)
+                ctx.set(dut.axi.tready, 1)
+                _, _, tdata, tvalid, tfirst, tlast, tkeep, tstrb = await ctx.tick().sample(
+                    dut.axi.tdata, dut.axi.tvalid,
+                    dut.axi.tfirst, dut.axi.tlast,
+                    dut.axi.tkeep, dut.axi.tstrb)
+                if tvalid:
+                    results.append({
+                        "tdata": tdata,
+                        "tfirst": tfirst,
+                        "tlast": tlast,
+                        "tkeep": tkeep,
+                        "tstrb": tstrb,
+                    })
+
+            # One more tick
+            ctx.set(dut.i_stream.valid, 0)
+            _, _, tdata, tvalid, tfirst, tlast, tkeep, tstrb = await ctx.tick().sample(
+                dut.axi.tdata, dut.axi.tvalid,
+                dut.axi.tfirst, dut.axi.tlast,
+                dut.axi.tkeep, dut.axi.tstrb)
+            if tvalid:
+                results.append({
+                    "tdata": tdata,
+                    "tfirst": tfirst,
+                    "tlast": tlast,
+                    "tkeep": tkeep,
+                    "tstrb": tstrb,
+                })
+
+        _run_sim(dut, tb, vcd_name="test_stream_to_axi_tfirst.vcd")
+
+        # Verify: tfirst should directly reflect the stream's first signal
+        assert len(results) >= 2
+        assert results[0]["tfirst"] == 1, f"First beat should have tfirst=1, got {results[0]}"
+        for r in results[1:]:
+            assert r["tfirst"] == 0, f"Non-first beat should have tfirst=0, got {r}"
