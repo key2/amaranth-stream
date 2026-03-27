@@ -5,7 +5,7 @@
 [![License: BSD-2](https://img.shields.io/badge/license-BSD--2-green.svg)](LICENSE.txt)
 [![PDM](https://img.shields.io/badge/pdm-managed-blueviolet)](https://pdm-project.org)
 
-**A comprehensive stream processing library for [Amaranth HDL](https://amaranth-lang.org/)** — providing 44 production-ready components for building high-performance streaming data pipelines in digital hardware.
+**A comprehensive stream processing library for [Amaranth HDL](https://amaranth-lang.org/)** — providing 52 production-ready components for building high-performance streaming data pipelines in digital hardware.
 
 ---
 
@@ -26,6 +26,7 @@
     - [Signature](#signature)
     - [Interface](#interface)
     - [core_to_extended](#core_to_extended)
+    - [connect_streams](#connect_streams)
   - [Simulation BFMs](#simulation-bfms)
     - [StreamSimSender](#streamsimsender)
     - [StreamSimReceiver](#streamsimreceiver)
@@ -47,6 +48,7 @@
     - [StreamCast](#streamcast)
     - [Pack](#pack)
     - [Unpack](#unpack)
+    - [ByteEnableSerializer](#byteenableserializer)
   - [Routing](#routing)
     - [StreamMux](#streammux)
     - [StreamDemux](#streamdemux)
@@ -69,14 +71,21 @@
     - [StreamMap](#streammap)
     - [StreamFilter](#streamfilter)
     - [EndianSwap](#endianswap)
+    - [GranularEndianSwap](#granularendianswap)
     - [ByteAligner](#bytealigner)
+    - [PacketAligner](#packetaligner)
+    - [WordReorder](#wordreorder)
   - [Monitoring & Debug](#monitoring--debug)
     - [StreamMonitor](#streammonitor)
     - [StreamChecker](#streamchecker)
+    - [StreamProtocolChecker](#streamprotocolchecker)
   - [AXI-Stream Bridge](#axi-stream-bridge)
     - [AXIStreamSignature](#axistreamSignature)
     - [AXIStreamToStream](#axistreamtostream)
     - [StreamToAXIStream](#streamtoaxistream)
+  - [SOP/EOP Adapter](#sopeop-adapter)
+    - [SOPEOPAdapter](#sopeopadapter)
+    - [StreamToSOPEOP](#streamtosopeop)
 - [Testing](#testing)
 - [Architecture Notes](#architecture-notes)
 - [Component Summary Table](#component-summary-table)
@@ -90,32 +99,34 @@
 ### Key Features
 
 - **Extended stream protocol** — `first`/`last` packet framing, `param` sideband, `keep` byte-enables
-- **44 production-ready components** across 11 categories
+- **52 production-ready components** across 12 categories
 - **Simulation BFMs** — `StreamSimSender` / `StreamSimReceiver` for async testbenches
 - **Pipeline construction** — declarative `Pipeline` builder and `BufferizeEndpoints` wrapper
-- **Width conversion** — integer-ratio, non-integer (LCM), gearbox, pack/unpack
+- **Width conversion** — integer-ratio, non-integer (LCM), gearbox, pack/unpack, byte-enable serialization
 - **Packet processing** — packetizer, depacketizer, atomic packet FIFO, stitcher
 - **Arbitration** — packet-aware round-robin/priority arbiter and dispatcher
 - **AXI-Stream bridge** — bidirectional conversion to/from AXI-Stream
-- **Monitoring** — performance counters and protocol assertion checkers
-- **Full test coverage** — 14 test modules with comprehensive simulation tests
+- **SOP/EOP adapter** — bridge to/from SOP/EOP framing (Gowin PCIe, Avalon-ST, Aurora)
+- **Monitoring** — performance counters, protocol assertion checkers, protocol violation detector
+- **Full test coverage** — 15 test modules with comprehensive simulation tests
 
 ### Component Categories
 
 | Category | Components | Count |
 |----------|-----------|-------|
-| Core | `Signature`, `Interface`, `core_to_extended` | 3 |
+| Core | `Signature`, `Interface`, `core_to_extended`, `connect_streams` | 4 |
 | Simulation BFMs | `StreamSimSender`, `StreamSimReceiver` | 2 |
 | Buffering & Pipeline | `Buffer`, `PipeValid`, `PipeReady`, `Delay`, `Pipeline`, `BufferizeEndpoints` | 6 |
 | FIFOs & CDC | `StreamFIFO`, `StreamAsyncFIFO`, `StreamCDC` | 3 |
-| Width Conversion | `StreamConverter`, `StrideConverter`, `Gearbox`, `StreamCast`, `Pack`, `Unpack` | 6 |
+| Width Conversion | `StreamConverter`, `StrideConverter`, `Gearbox`, `StreamCast`, `Pack`, `Unpack`, `ByteEnableSerializer` | 7 |
 | Routing | `StreamMux`, `StreamDemux`, `StreamGate`, `StreamSplitter`, `StreamJoiner` | 5 |
 | Packet Processing | `HeaderLayout`, `Packetizer`, `Depacketizer`, `PacketFIFO`, `PacketStatus`, `Stitcher`, `LastInserter`, `LastOnTimeout` | 8 |
 | Arbitration | `StreamArbiter`, `StreamDispatcher` | 2 |
-| Data Transformation | `StreamMap`, `StreamFilter`, `EndianSwap`, `ByteAligner` | 4 |
-| Monitoring & Debug | `StreamMonitor`, `StreamChecker` | 2 |
+| Data Transformation | `StreamMap`, `StreamFilter`, `EndianSwap`, `GranularEndianSwap`, `ByteAligner`, `PacketAligner`, `WordReorder` | 7 |
+| Monitoring & Debug | `StreamMonitor`, `StreamChecker`, `StreamProtocolChecker` | 3 |
 | AXI-Stream Bridge | `AXIStreamSignature`, `AXIStreamToStream`, `StreamToAXIStream` | 3 |
-| **Total** | | **44** |
+| SOP/EOP Adapter | `SOPEOPAdapter`, `StreamToSOPEOP` | 2 |
+| **Total** | | **52** |
 
 ---
 
@@ -468,6 +479,43 @@ from amaranth_stream import core_to_extended
 core_sig = CoreSignature(8)
 ext_sig = core_to_extended(core_sig)
 # ext_sig is now an amaranth_stream.Signature(8)
+```
+
+---
+
+#### connect_streams
+
+```python
+def connect_streams(m, src, dst, *, exclude=None)
+```
+
+Connect two stream interfaces combinationally. Wires `src` (source/initiator) to `dst` (destination/target), connecting handshake signals, payload, and any optional members that both interfaces share.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `m` | `Module` | *(required)* | The module to add combinational statements to |
+| `src` | stream interface | *(required)* | Source stream (drives payload, valid, and forward sideband signals) |
+| `dst` | stream interface | *(required)* | Destination stream (drives ready) |
+| `exclude` | `set` of `str` or `None` | `None` | Optional set of member names to skip when connecting |
+
+**Behavior:** Only members present on **both** `src` and `dst` are connected. If one side has `first`/`last` but the other does not, those signals are silently skipped. The `exclude` parameter can suppress connection of any member by name.
+
+**Example:**
+
+```python
+from amaranth_stream import Signature, connect_streams
+
+sig = Signature(32, has_first_last=True)
+src = sig.create()
+dst = sig.create()
+
+# In elaborate():
+connect_streams(m, src, dst)
+
+# Skip param connection:
+connect_streams(m, src, dst, exclude={"param"})
 ```
 
 ---
@@ -1356,6 +1404,55 @@ from amaranth_stream import Signature, Unpack
 o_sig = Signature(8, has_first_last=True)
 unpack = Unpack(o_sig, 4)
 # unpack.i_stream has 32-bit payload
+```
+
+---
+
+#### ByteEnableSerializer
+
+```python
+class ByteEnableSerializer(wiring.Component)
+```
+
+Serialize a wide stream with byte enables into a narrow stream of valid bytes. Converts a wide input stream (e.g. 256-bit with 32-byte keep mask) into a narrow output stream (e.g. 8-bit) by emitting only the bytes/chunks whose corresponding `keep` bits are set, skipping those where `keep=0`.
+
+This is useful for things like PCIe TLP sniffers that need to serialize a 256-bit stream with sparse byte enables down to an 8-bit byte stream.
+
+**Constructor:**
+
+```python
+ByteEnableSerializer(
+    i_width,                 # int — input data width in bits (multiple of 8)
+    o_width=8,               # int — output data width in bits (multiple of 8)
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `i_width` | `int` | *(required)* | Input data width in bits. Must be a multiple of 8. |
+| `o_width` | `int` | `8` | Output data width in bits. Must be a multiple of 8. `i_width` must be ≥ `o_width`. |
+
+**Ports:**
+
+| Port | Direction | Description |
+|------|-----------|-------------|
+| `i_stream` | `In(Signature(i_width, has_first_last=True, has_keep=True))` | Input stream with byte enables |
+| `o_stream` | `Out(Signature(o_width, has_first_last=True))` | Output stream (all output bytes are valid, no keep needed) |
+
+**Behavior:** Uses an IDLE/DRAIN FSM. In IDLE, latches the input beat. In DRAIN, iterates through chunks, emitting only those with valid keep bits. `first` is set on the first valid output chunk, `last` on the last valid output chunk.
+
+**Example:**
+
+```python
+from amaranth_stream import ByteEnableSerializer
+
+# Serialize 256-bit stream with byte enables to 8-bit byte stream
+ser = ByteEnableSerializer(256, 8)
+
+# Serialize 128-bit stream to 32-bit chunks
+ser32 = ByteEnableSerializer(128, 32)
 ```
 
 ---
@@ -2399,6 +2496,154 @@ aligner = ByteAligner(sig, max_shift=3)
 
 ---
 
+#### GranularEndianSwap
+
+```python
+class GranularEndianSwap(wiring.Component)
+```
+
+Per-chunk byte-order reversal for multi-DWORD streams. Unlike `EndianSwap` which reverses all bytes across the full data width, this component reverses bytes independently within each `chunk_size`-bit chunk. This is required by PCIe and many protocols that need per-DWORD (32-bit) independent byte reversal.
+
+**Constructor:**
+
+```python
+GranularEndianSwap(
+    data_width,              # int — total data width in bits
+    chunk_size=32,           # int — size of each chunk in bits (default 32 for DWORD)
+    *,
+    field="dat",             # str — which payload field to swap
+    be_mode=False,           # bool — also reverse keep bits within each chunk
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `data_width` | `int` | *(required)* | Total data width in bits. Must be a multiple of `chunk_size`. |
+| `chunk_size` | `int` | `32` | Size of each chunk in bits. Must be a multiple of 8. |
+| `field` | `str` | `"dat"` | Which payload field to swap. Currently only `"dat"` (payload) is supported. |
+| `be_mode` | `bool` | `False` | When `True`, also reverse the byte-enable (`keep`) bits within each chunk. |
+
+**Ports:**
+
+| Port | Direction | Description |
+|------|-----------|-------------|
+| `i_stream` | `In(signature)` | Input stream |
+| `o_stream` | `Out(signature)` | Output stream with per-chunk reversed byte order |
+
+**Example:**
+
+```python
+from amaranth_stream import GranularEndianSwap
+
+# Per-DWORD byte swap on 128-bit data (4 DWORDs, each independently reversed)
+swap = GranularEndianSwap(128, chunk_size=32)
+# Input:  [D0B0,D0B1,D0B2,D0B3, D1B0,D1B1,D1B2,D1B3, ...]
+# Output: [D0B3,D0B2,D0B1,D0B0, D1B3,D1B2,D1B1,D1B0, ...]
+```
+
+---
+
+#### PacketAligner
+
+```python
+class PacketAligner(wiring.Component)
+```
+
+Cross-beat packet realignment for wide data buses. Many protocols (e.g. PCIe PHY RX) deliver packets that start at a non-zero offset within a wide data word. This component stitches data across beat boundaries so that the output packet is aligned to offset 0.
+
+**Constructor:**
+
+```python
+PacketAligner(
+    data_width,              # int — total data width in bits (e.g. 128)
+    granularity=32,          # int — alignment granularity in bits (default 32 for DWORD)
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `data_width` | `int` | *(required)* | Total data width in bits. Must be a multiple of `granularity`. |
+| `granularity` | `int` | `32` | Alignment granularity in bits. `data_width` must be ≥ `granularity`. |
+
+**Ports:**
+
+| Port | Direction | Description |
+|------|-----------|-------------|
+| `i_stream` | `In(Signature(data_width, has_first_last=True))` | Input stream |
+| `o_stream` | `Out(Signature(data_width, has_first_last=True))` | Output stream with realigned payload |
+| `offset` | `In(range(n_lanes))` | Starting offset in granularity units. Sampled when `first=1` on input. |
+
+**Behavior:** Uses an FSM with IDLE, PASS, ALIGN, and FLUSH states. When offset is 0, passes through directly. When offset is non-zero, absorbs the first beat into a carry register, then stitches carry with subsequent beats using a barrel shifter. A flush beat emits remaining carry data at packet end.
+
+**Example:**
+
+```python
+from amaranth_stream import PacketAligner
+
+# 128-bit data bus with DWORD alignment
+aligner = PacketAligner(128, granularity=32)
+# offset=2: packet starts at DWORD 2 of the first beat
+# The aligner shifts data so output starts at DWORD 0
+```
+
+---
+
+#### WordReorder
+
+```python
+class WordReorder(wiring.Component)
+```
+
+Reorder words within a data beat according to a fixed permutation. Useful for reversing DWORDs in a wide data word or performing arbitrary word-level shuffles.
+
+**Constructor:**
+
+```python
+WordReorder(
+    data_width,              # int — total data width in bits (e.g. 256)
+    word_width=32,           # int — width of each word in bits (default 32 for DWORD)
+    *,
+    order,                   # tuple of int — reorder pattern
+    field="dat",             # str — which field to reorder
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `data_width` | `int` | *(required)* | Total data width in bits. Must be a multiple of `word_width`. |
+| `word_width` | `int` | `32` | Width of each word in bits. |
+| `order` | `tuple` of `int` | *(required)* | Reorder pattern. `order[i]` specifies which input word index supplies output word `i`. Length must equal `data_width // word_width`. |
+| `field` | `str` | `"dat"` | Which field to reorder. Currently only `"dat"` (payload) is supported. |
+
+**Ports:**
+
+| Port | Direction | Description |
+|------|-----------|-------------|
+| `i_stream` | `In(signature)` | Input stream |
+| `o_stream` | `Out(signature)` | Output stream with reordered words |
+
+**Behavior:** Applies the permutation to both payload words and corresponding keep bits. All other signals pass through unchanged.
+
+**Example:**
+
+```python
+from amaranth_stream import WordReorder
+
+# Reverse 8 DWORDs in a 256-bit word
+reorder = WordReorder(256, word_width=32, order=(7, 6, 5, 4, 3, 2, 1, 0))
+
+# Swap pairs of DWORDs in a 128-bit word
+swap_pairs = WordReorder(128, word_width=32, order=(1, 0, 3, 2))
+```
+
+---
+
 ### Monitoring & Debug
 
 *Module: `amaranth_stream.monitor`*
@@ -2515,6 +2760,66 @@ checker = StreamChecker(sig)
 
 ---
 
+#### StreamProtocolChecker
+
+```python
+class StreamProtocolChecker(wiring.Component)
+```
+
+Protocol checker with error codes for stream protocol violations. Passively monitors a stream and reports protocol violations with specific error codes. The checker does not drive `ready` or `valid` — it is purely an observer.
+
+**Constructor:**
+
+```python
+StreamProtocolChecker(
+    signature,               # Signature — stream signature
+    domain="sync",           # str — clock domain (default "sync")
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `signature` | `Signature` | *(required)* | Stream signature to monitor |
+| `domain` | `str` | `"sync"` | Clock domain |
+
+**Ports:**
+
+| Port | Direction | Description |
+|------|-----------|-------------|
+| `stream` | `In(signature)` | Stream to monitor (passive — does NOT drive ready) |
+| `error` | `Out(1)` | Asserted when a protocol violation is detected this cycle |
+| `error_code` | `Out(2)` | Indicates which violation occurred (0–3) |
+
+**Error Codes:**
+
+| Code | Description |
+|------|-------------|
+| 0 | No error |
+| 1 | `first` without preceding `last` |
+| 2 | `valid` deasserted without handshake |
+| 3 | `payload` changed without handshake |
+
+**Behavior:** Unlike `StreamChecker` (which has a sticky error flag), `StreamProtocolChecker` reports errors on a per-cycle basis with specific error codes. It checks valid persistence, payload stability, and first/last sequencing.
+
+**Example:**
+
+```python
+from amaranth_stream import Signature, StreamProtocolChecker
+
+sig = Signature(32, has_first_last=True)
+checker = StreamProtocolChecker(sig)
+
+# In testbench:
+# error = ctx.get(checker.error)
+# code = ctx.get(checker.error_code)
+# if error:
+#     print(f"Protocol violation! Code: {code}")
+```
+
+---
+
 ### AXI-Stream Bridge
 
 *Module: `amaranth_stream.axi_stream`*
@@ -2538,6 +2843,7 @@ AXIStreamSignature(
     id_width=0,              # int — TID width (0 to omit)
     dest_width=0,            # int — TDEST width (0 to omit)
     user_width=0,            # int — TUSER width (0 to omit)
+    has_tfirst=False,        # bool — include TFIRST signal
 )
 ```
 
@@ -2549,6 +2855,7 @@ AXIStreamSignature(
 | `id_width` | `int` | `0` | TID width. 0 to omit. |
 | `dest_width` | `int` | `0` | TDEST width. 0 to omit. |
 | `user_width` | `int` | `0` | TUSER width. 0 to omit. |
+| `has_tfirst` | `bool` | `False` | If `True`, include a `tfirst` member signal. |
 
 **Members:**
 
@@ -2560,6 +2867,7 @@ AXIStreamSignature(
 | `tkeep` | `Out` | `data_width // 8` | Always |
 | `tstrb` | `Out` | `data_width // 8` | Always |
 | `tlast` | `Out` | 1 | Always |
+| `tfirst` | `Out` | 1 | `has_tfirst=True` |
 | `tid` | `Out` | `id_width` | `id_width > 0` |
 | `tdest` | `Out` | `dest_width` | `dest_width > 0` |
 | `tuser` | `Out` | `user_width` | `user_width > 0` |
@@ -2572,6 +2880,7 @@ AXIStreamSignature(
 | `id_width` | `int` | TID width |
 | `dest_width` | `int` | TDEST width |
 | `user_width` | `int` | TUSER width |
+| `has_tfirst` | `bool` | Whether TFIRST is included |
 
 **Example:**
 
@@ -2698,6 +3007,119 @@ bridge = StreamToAXIStream(stream_sig, axi_sig)
 
 ---
 
+### SOP/EOP Adapter
+
+*Module: `amaranth_stream.adapter`*
+
+Components for bridging between SOP/EOP/valid-mask framing (common in FPGA hard IP such as Gowin PCIe, Xilinx Aurora, Intel Avalon-ST) and amaranth-stream's valid/ready/first/last framing.
+
+#### SOPEOPAdapter
+
+```python
+class SOPEOPAdapter(wiring.Component)
+```
+
+Convert SOP/EOP/valid-mask framing to amaranth-stream. Bridges from FPGA hard IP interfaces to amaranth-stream's valid/ready/first/last protocol.
+
+**Constructor:**
+
+```python
+SOPEOPAdapter(
+    data_width,              # int — data bus width in bits (multiple of 32)
+    *,
+    granularity="byte",      # str — valid-mask granularity: "bit", "byte", or "dword"
+    dword_reorder=False,     # bool — reverse DWORD order within the data word
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `data_width` | `int` | *(required)* | Width of the data bus in bits. Must be a multiple of 32. |
+| `granularity` | `str` | `"byte"` | Valid-mask granularity: `"bit"`, `"byte"`, or `"dword"`. |
+| `dword_reorder` | `bool` | `False` | When `True`, reverses DWORD order within the data word. |
+
+**Ports:**
+
+| Port | Direction | Description |
+|------|-----------|-------------|
+| `sink` | `In(SOPEOPSignature)` | SOP/EOP input from hard IP (data, sop, eop, valid_mask, valid, ready) |
+| `source` | `Out(StreamSignature)` | amaranth-stream output with `first`, `last`, and `keep` |
+
+**Signal Mapping:**
+
+| SOP/EOP | amaranth_stream | Notes |
+|---------|----------------|-------|
+| `data` | `payload` | Direct mapping (or DWORD-reordered) |
+| `sop` | `first` | Direct mapping |
+| `eop` | `last` | Direct mapping |
+| `valid_mask` | `keep` | Expanded from granularity to byte-level |
+| `valid` | `valid` | Direct mapping |
+| `ready` | `ready` | Direct mapping |
+
+**Example:**
+
+```python
+from amaranth_stream import SOPEOPAdapter
+
+# 256-bit data bus with byte-level valid mask
+adapter = SOPEOPAdapter(256, granularity="byte")
+
+# With DWORD reordering (e.g. for Gowin PCIe)
+adapter_reorder = SOPEOPAdapter(256, granularity="dword", dword_reorder=True)
+```
+
+---
+
+#### StreamToSOPEOP
+
+```python
+class StreamToSOPEOP(wiring.Component)
+```
+
+Convert amaranth-stream to SOP/EOP/valid-mask framing. Bridges from amaranth-stream's valid/ready/first/last protocol to FPGA hard IP interfaces.
+
+**Constructor:**
+
+```python
+StreamToSOPEOP(
+    data_width,              # int — data bus width in bits (multiple of 32)
+    *,
+    granularity="byte",      # str — valid-mask granularity: "bit", "byte", or "dword"
+    dword_reorder=False,     # bool — reverse DWORD order within the data word
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `data_width` | `int` | *(required)* | Width of the data bus in bits. Must be a multiple of 32. |
+| `granularity` | `str` | `"byte"` | Valid-mask granularity: `"bit"`, `"byte"`, or `"dword"`. |
+| `dword_reorder` | `bool` | `False` | When `True`, reverses DWORD order within the data word. |
+
+**Ports:**
+
+| Port | Direction | Description |
+|------|-----------|-------------|
+| `sink` | `In(StreamSignature)` | amaranth-stream input with `first`, `last`, and `keep` |
+| `source` | `Out(SOPEOPSignature)` | SOP/EOP output to hard IP |
+
+**Example:**
+
+```python
+from amaranth_stream import StreamToSOPEOP
+
+# 256-bit data bus with byte-level valid mask
+bridge = StreamToSOPEOP(256, granularity="byte")
+
+# With DWORD reordering
+bridge_reorder = StreamToSOPEOP(256, granularity="dword", dword_reorder=True)
+```
+
+---
+
 ## Testing
 
 The library includes comprehensive tests for all components. Run them with PDM:
@@ -2719,6 +3141,7 @@ pdm run pytest tests/test_pipeline.py -v
 pdm run pytest tests/test_transform.py -v
 pdm run pytest tests/test_monitor.py -v
 pdm run pytest tests/test_axi_stream.py -v
+pdm run pytest tests/test_adapter.py -v
 pdm run pytest tests/test_integration.py -v
 
 # Run with verbose output and stop on first failure
@@ -2741,9 +3164,10 @@ pdm run pytest tests/test_buffer.py::TestBuffer::test_pipe_valid -v
 | `test_packet.py` | `HeaderLayout`, `Packetizer`, `Depacketizer`, `PacketFIFO`, `PacketStatus`, `Stitcher`, `LastInserter`, `LastOnTimeout` |
 | `test_arbiter.py` | `StreamArbiter`, `StreamDispatcher` |
 | `test_pipeline.py` | `Pipeline`, `BufferizeEndpoints` |
-| `test_transform.py` | `StreamMap`, `StreamFilter`, `EndianSwap`, `ByteAligner` |
-| `test_monitor.py` | `StreamMonitor`, `StreamChecker` |
+| `test_transform.py` | `StreamMap`, `StreamFilter`, `EndianSwap`, `GranularEndianSwap`, `ByteAligner`, `PacketAligner`, `WordReorder` |
+| `test_monitor.py` | `StreamMonitor`, `StreamChecker`, `StreamProtocolChecker` |
 | `test_axi_stream.py` | `AXIStreamSignature`, `AXIStreamToStream`, `StreamToAXIStream` |
+| `test_adapter.py` | `SOPEOPAdapter`, `StreamToSOPEOP` |
 | `test_integration.py` | End-to-end pipeline integration tests |
 
 ---
@@ -2796,7 +3220,7 @@ Sink drives:    ready (Out)
 
 ### Import Structure
 
-All 44 components are re-exported from the top-level `amaranth_stream` package:
+All 52 components are re-exported from the top-level `amaranth_stream` package:
 
 ```python
 # Import everything
@@ -2815,47 +3239,55 @@ from amaranth_stream import Signature, Buffer, StreamFIFO, Pipeline
 | 1 | `Signature` | `_base` | Core | Extended stream signature with optional first/last, param, keep |
 | 2 | `Interface` | `_base` | Core | Concrete stream interface from a Signature |
 | 3 | `core_to_extended` | `_base` | Core | Convert core Amaranth stream signature to extended |
-| 4 | `StreamSimSender` | `sim` | Sim BFM | Testbench BFM: drives stream source |
-| 5 | `StreamSimReceiver` | `sim` | Sim BFM | Testbench BFM: consumes stream sink |
-| 6 | `Buffer` | `buffer` | Buffering | Pipeline register (configurable forward/backward) |
-| 7 | `PipeValid` | `buffer` | Buffering | Forward-registered pipeline stage |
-| 8 | `PipeReady` | `buffer` | Buffering | Backward-registered pipeline stage |
-| 9 | `Delay` | `buffer` | Buffering | N-stage pipeline delay |
-| 10 | `Pipeline` | `pipeline` | Pipeline | Declarative pipeline builder |
-| 11 | `BufferizeEndpoints` | `pipeline` | Pipeline | Wrap component with buffers on all stream ports |
-| 12 | `StreamFIFO` | `fifo` | FIFO | Synchronous FIFO with stream interfaces |
-| 13 | `StreamAsyncFIFO` | `fifo` | FIFO | Asynchronous (cross-domain) FIFO |
-| 14 | `StreamCDC` | `cdc` | CDC | Automatic clock-domain crossing |
-| 15 | `StreamConverter` | `converter` | Width Conv. | Integer-ratio width converter |
-| 16 | `StrideConverter` | `converter` | Width Conv. | Non-integer ratio width converter (LCM) |
-| 17 | `Gearbox` | `converter` | Width Conv. | Shift-register width converter |
-| 18 | `StreamCast` | `converter` | Width Conv. | Zero-cost bit reinterpretation |
-| 19 | `Pack` | `converter` | Width Conv. | N narrow → 1 wide beat |
-| 20 | `Unpack` | `converter` | Width Conv. | 1 wide → N narrow beats |
-| 21 | `StreamMux` | `routing` | Routing | N:1 multiplexer |
-| 22 | `StreamDemux` | `routing` | Routing | 1:N demultiplexer |
-| 23 | `StreamGate` | `routing` | Routing | Enable/disable gate |
-| 24 | `StreamSplitter` | `routing` | Routing | 1:N synchronized broadcast |
-| 25 | `StreamJoiner` | `routing` | Routing | N:1 round-robin join |
-| 26 | `HeaderLayout` | `packet` | Packet | Declarative header definition |
-| 27 | `Packetizer` | `packet` | Packet | Insert header before payload |
-| 28 | `Depacketizer` | `packet` | Packet | Extract header, strip header beats |
-| 29 | `PacketFIFO` | `packet` | Packet | Atomic packet FIFO |
-| 30 | `PacketStatus` | `packet` | Packet | Packet boundary tracker (tap-only) |
-| 31 | `Stitcher` | `packet` | Packet | Group N packets into one |
-| 32 | `LastInserter` | `packet` | Packet | Fixed-size packet creation |
-| 33 | `LastOnTimeout` | `packet` | Packet | Timeout-based packet termination |
-| 34 | `StreamArbiter` | `arbiter` | Arbitration | Packet-aware N:1 arbiter |
-| 35 | `StreamDispatcher` | `arbiter` | Arbitration | Packet-aware 1:N dispatcher |
-| 36 | `StreamMap` | `transform` | Transform | Combinational payload transformation |
-| 37 | `StreamFilter` | `transform` | Transform | Conditional beat dropping |
-| 38 | `EndianSwap` | `transform` | Transform | Byte-order reversal |
-| 39 | `ByteAligner` | `transform` | Transform | Sub-word byte alignment |
-| 40 | `StreamMonitor` | `monitor` | Debug | Performance counters (tap-through) |
-| 41 | `StreamChecker` | `monitor` | Debug | Protocol assertion checker |
-| 42 | `AXIStreamSignature` | `axi_stream` | AXI Bridge | AXI-Stream interface definition |
-| 43 | `AXIStreamToStream` | `axi_stream` | AXI Bridge | AXI-Stream → amaranth_stream |
-| 44 | `StreamToAXIStream` | `axi_stream` | AXI Bridge | amaranth_stream → AXI-Stream |
+| 4 | `connect_streams` | `_base` | Core | Connect two stream interfaces combinationally |
+| 5 | `StreamSimSender` | `sim` | Sim BFM | Testbench BFM: drives stream source |
+| 6 | `StreamSimReceiver` | `sim` | Sim BFM | Testbench BFM: consumes stream sink |
+| 7 | `Buffer` | `buffer` | Buffering | Pipeline register (configurable forward/backward) |
+| 8 | `PipeValid` | `buffer` | Buffering | Forward-registered pipeline stage |
+| 9 | `PipeReady` | `buffer` | Buffering | Backward-registered pipeline stage |
+| 10 | `Delay` | `buffer` | Buffering | N-stage pipeline delay |
+| 11 | `Pipeline` | `pipeline` | Pipeline | Declarative pipeline builder |
+| 12 | `BufferizeEndpoints` | `pipeline` | Pipeline | Wrap component with buffers on all stream ports |
+| 13 | `StreamFIFO` | `fifo` | FIFO | Synchronous FIFO with stream interfaces |
+| 14 | `StreamAsyncFIFO` | `fifo` | FIFO | Asynchronous (cross-domain) FIFO |
+| 15 | `StreamCDC` | `cdc` | CDC | Automatic clock-domain crossing |
+| 16 | `StreamConverter` | `converter` | Width Conv. | Integer-ratio width converter |
+| 17 | `StrideConverter` | `converter` | Width Conv. | Non-integer ratio width converter (LCM) |
+| 18 | `Gearbox` | `converter` | Width Conv. | Shift-register width converter |
+| 19 | `StreamCast` | `converter` | Width Conv. | Zero-cost bit reinterpretation |
+| 20 | `Pack` | `converter` | Width Conv. | N narrow → 1 wide beat |
+| 21 | `Unpack` | `converter` | Width Conv. | 1 wide → N narrow beats |
+| 22 | `ByteEnableSerializer` | `converter` | Width Conv. | Serialize wide stream with byte enables to narrow stream |
+| 23 | `StreamMux` | `routing` | Routing | N:1 multiplexer |
+| 24 | `StreamDemux` | `routing` | Routing | 1:N demultiplexer |
+| 25 | `StreamGate` | `routing` | Routing | Enable/disable gate |
+| 26 | `StreamSplitter` | `routing` | Routing | 1:N synchronized broadcast |
+| 27 | `StreamJoiner` | `routing` | Routing | N:1 round-robin join |
+| 28 | `HeaderLayout` | `packet` | Packet | Declarative header definition |
+| 29 | `Packetizer` | `packet` | Packet | Insert header before payload |
+| 30 | `Depacketizer` | `packet` | Packet | Extract header, strip header beats |
+| 31 | `PacketFIFO` | `packet` | Packet | Atomic packet FIFO |
+| 32 | `PacketStatus` | `packet` | Packet | Packet boundary tracker (tap-only) |
+| 33 | `Stitcher` | `packet` | Packet | Group N packets into one |
+| 34 | `LastInserter` | `packet` | Packet | Fixed-size packet creation |
+| 35 | `LastOnTimeout` | `packet` | Packet | Timeout-based packet termination |
+| 36 | `StreamArbiter` | `arbiter` | Arbitration | Packet-aware N:1 arbiter |
+| 37 | `StreamDispatcher` | `arbiter` | Arbitration | Packet-aware 1:N dispatcher |
+| 38 | `StreamMap` | `transform` | Transform | Combinational payload transformation |
+| 39 | `StreamFilter` | `transform` | Transform | Conditional beat dropping |
+| 40 | `EndianSwap` | `transform` | Transform | Byte-order reversal |
+| 41 | `GranularEndianSwap` | `transform` | Transform | Per-chunk byte-order reversal |
+| 42 | `ByteAligner` | `transform` | Transform | Sub-word byte alignment |
+| 43 | `PacketAligner` | `transform` | Transform | Cross-beat packet realignment |
+| 44 | `WordReorder` | `transform` | Transform | Fixed-permutation word reorder |
+| 45 | `StreamMonitor` | `monitor` | Debug | Performance counters (tap-through) |
+| 46 | `StreamChecker` | `monitor` | Debug | Protocol assertion checker (sticky) |
+| 47 | `StreamProtocolChecker` | `monitor` | Debug | Protocol checker with error codes |
+| 48 | `AXIStreamSignature` | `axi_stream` | AXI Bridge | AXI-Stream interface definition |
+| 49 | `AXIStreamToStream` | `axi_stream` | AXI Bridge | AXI-Stream → amaranth_stream |
+| 50 | `StreamToAXIStream` | `axi_stream` | AXI Bridge | amaranth_stream → AXI-Stream |
+| 51 | `SOPEOPAdapter` | `adapter` | SOP/EOP | SOP/EOP → amaranth_stream bridge |
+| 52 | `StreamToSOPEOP` | `adapter` | SOP/EOP | amaranth_stream → SOP/EOP bridge |
 
 ---
 
