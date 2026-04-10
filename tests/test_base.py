@@ -14,6 +14,7 @@ from amaranth_stream._base import Signature, Interface, core_to_extended
 # Signature creation
 # ---------------------------------------------------------------------------
 
+
 class TestSignatureCreation:
     """Test Signature construction with various parameter combinations."""
 
@@ -66,6 +67,7 @@ class TestSignatureCreation:
 # ---------------------------------------------------------------------------
 # Optional members
 # ---------------------------------------------------------------------------
+
 
 class TestSignatureOptionalMembers:
     """Test has_first_last, param_shape, has_keep."""
@@ -129,16 +131,30 @@ class TestSignatureOptionalMembers:
         assert "keep" not in sig.members
 
     def test_all_options(self):
-        sig = Signature(unsigned(32),
-                        always_valid=True, always_ready=True,
-                        has_first_last=True, param_shape=4, has_keep=True)
-        expected_members = {"payload", "valid", "ready", "first", "last", "param", "keep"}
+        sig = Signature(
+            unsigned(32),
+            always_valid=True,
+            always_ready=True,
+            has_first_last=True,
+            param_shape=4,
+            has_keep=True,
+        )
+        expected_members = {
+            "payload",
+            "valid",
+            "ready",
+            "first",
+            "last",
+            "param",
+            "keep",
+        }
         assert set(sig.members.keys()) == expected_members
 
 
 # ---------------------------------------------------------------------------
 # Member directions
 # ---------------------------------------------------------------------------
+
 
 class TestSignatureMemberDirections:
     """Verify Out/In directions of members."""
@@ -175,6 +191,7 @@ class TestSignatureMemberDirections:
 # ---------------------------------------------------------------------------
 # Interface creation
 # ---------------------------------------------------------------------------
+
 
 class TestInterface:
     """Test Interface creation and properties."""
@@ -249,6 +266,7 @@ class TestInterface:
 # Signature equality
 # ---------------------------------------------------------------------------
 
+
 class TestSignatureEquality:
     """Test __eq__ for Signature."""
 
@@ -274,8 +292,13 @@ class TestSignatureEquality:
         assert Signature(8) != Signature(8, has_keep=True)
 
     def test_equal_all_options(self):
-        kwargs = dict(always_valid=True, always_ready=True,
-                      has_first_last=True, param_shape=4, has_keep=True)
+        kwargs = dict(
+            always_valid=True,
+            always_ready=True,
+            has_first_last=True,
+            param_shape=4,
+            has_keep=True,
+        )
         assert Signature(unsigned(32), **kwargs) == Signature(unsigned(32), **kwargs)
 
     def test_not_equal_to_non_signature(self):
@@ -288,6 +311,7 @@ class TestSignatureEquality:
 # ---------------------------------------------------------------------------
 # Signature repr
 # ---------------------------------------------------------------------------
+
 
 class TestSignatureRepr:
     """Test __repr__ for Signature."""
@@ -324,6 +348,7 @@ class TestSignatureRepr:
 # Signature is a wiring.Signature subclass
 # ---------------------------------------------------------------------------
 
+
 class TestSignatureIsWiringSubclass:
     """Verify that our Signature is a proper wiring.Signature subclass."""
 
@@ -348,11 +373,13 @@ class TestSignatureIsWiringSubclass:
 # core_to_extended
 # ---------------------------------------------------------------------------
 
+
 class TestCoreToExtended:
     """Test the core_to_extended helper."""
 
     def test_basic_conversion(self):
         from amaranth.lib.stream import Signature as CoreSignature
+
         core = CoreSignature(16)
         ext = core_to_extended(core)
         assert isinstance(ext, Signature)
@@ -360,18 +387,21 @@ class TestCoreToExtended:
 
     def test_preserves_always_valid(self):
         from amaranth.lib.stream import Signature as CoreSignature
+
         core = CoreSignature(8, always_valid=True)
         ext = core_to_extended(core)
         assert ext.always_valid is True
 
     def test_preserves_always_ready(self):
         from amaranth.lib.stream import Signature as CoreSignature
+
         core = CoreSignature(8, always_ready=True)
         ext = core_to_extended(core)
         assert ext.always_ready is True
 
     def test_no_extra_members(self):
         from amaranth.lib.stream import Signature as CoreSignature
+
         core = CoreSignature(8)
         ext = core_to_extended(core)
         assert ext.has_first_last is False
@@ -420,18 +450,22 @@ class _ConnectBridge(wiring.Component):
         self._src_sig = src_sig
         self._dst_sig = dst_sig if dst_sig is not None else src_sig
         self._exclude = exclude
-        super().__init__({
-            "i_stream": In(self._src_sig),
-            "o_stream": Out(self._dst_sig),
-        })
+        super().__init__(
+            {
+                "i_stream": In(self._src_sig),
+                "o_stream": Out(self._dst_sig),
+            }
+        )
 
     def elaborate(self, platform):
         m = Module()
         # Add a sync domain so the simulator can add a clock
         m.domains += ClockDomain("sync")
-        connect_streams(m, wiring.flipped(self.i_stream),
-                        wiring.flipped(self.o_stream),
-                        exclude=self._exclude)
+        m.d.comb += connect_streams(
+            wiring.flipped(self.i_stream),
+            wiring.flipped(self.o_stream),
+            exclude=self._exclude,
+        )
         return m
 
 
@@ -475,8 +509,13 @@ class TestConnectStreamsBasic:
                 beat = await receiver.recv(ctx)
                 results.append(beat["payload"])
 
-        _run_sim(dut, sender_tb, receiver_tb,
-                 deadline_ns=100_000, vcd_name="test_cs_basic_bp.vcd")
+        _run_sim(
+            dut,
+            sender_tb,
+            receiver_tb,
+            deadline_ns=100_000,
+            vcd_name="test_cs_basic_bp.vcd",
+        )
         assert results == expected
 
 
@@ -559,8 +598,9 @@ class TestConnectStreamsWithKeepParam:
         assert results[1]["keep"] == 0x1
 
     def test_all_optional_signals(self):
-        sig = Signature(unsigned(8), has_first_last=True,
-                        param_shape=unsigned(4), has_keep=True)
+        sig = Signature(
+            unsigned(8), has_first_last=True, param_shape=unsigned(4), has_keep=True
+        )
         dut = _ConnectBridge(sig)
         results = []
 

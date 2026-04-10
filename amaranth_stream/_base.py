@@ -54,9 +54,16 @@ class Signature(wiring.Signature):
         Byte-enable mask.
     """
 
-    def __init__(self, payload_shape, *,
-                 always_valid=False, always_ready=False,
-                 has_first_last=False, param_shape=None, has_keep=False):
+    def __init__(
+        self,
+        payload_shape,
+        *,
+        always_valid=False,
+        always_ready=False,
+        has_first_last=False,
+        param_shape=None,
+        has_keep=False,
+    ):
         Shape.cast(payload_shape)
         self._payload_shape = payload_shape
         self._always_valid = bool(always_valid)
@@ -131,13 +138,15 @@ class Signature(wiring.Signature):
     # -- Comparison / repr ---------------------------------------------------
 
     def __eq__(self, other):
-        return (isinstance(other, Signature) and
-                self._payload_shape == other._payload_shape and
-                self._always_valid == other._always_valid and
-                self._always_ready == other._always_ready and
-                self._has_first_last == other._has_first_last and
-                self._param_shape == other._param_shape and
-                self._has_keep == other._has_keep)
+        return (
+            isinstance(other, Signature)
+            and self._payload_shape == other._payload_shape
+            and self._always_valid == other._always_valid
+            and self._always_ready == other._always_ready
+            and self._has_first_last == other._has_first_last
+            and self._param_shape == other._param_shape
+            and self._has_keep == other._has_keep
+        )
 
     def __repr__(self):
         params = [repr(self._payload_shape)]
@@ -179,9 +188,12 @@ class Interface:
         if not isinstance(signature, Signature):
             raise TypeError(
                 f"Signature of stream.Interface must be a stream.Signature, "
-                f"not {signature!r}")
+                f"not {signature!r}"
+            )
         self._signature = signature
-        self.__dict__.update(signature.members.create(path=path, src_loc_at=1 + src_loc_at))
+        self.__dict__.update(
+            signature.members.create(path=path, src_loc_at=1 + src_loc_at)
+        )
         if signature.always_valid:
             self.valid = Const(1)
         if signature.always_ready:
@@ -197,7 +209,11 @@ class Interface:
         return self.payload
 
     def __repr__(self):
-        parts = [f"payload={self.payload!r}", f"valid={self.valid!r}", f"ready={self.ready!r}"]
+        parts = [
+            f"payload={self.payload!r}",
+            f"valid={self.valid!r}",
+            f"ready={self.ready!r}",
+        ]
         if self._signature.has_first_last:
             parts.append(f"first={self.first!r}")
             parts.append(f"last={self.last!r}")
@@ -223,9 +239,11 @@ def core_to_extended(core_sig):
         ``always_valid`` / ``always_ready`` flags.
     """
     from amaranth.lib.stream import Signature as CoreSignature
+
     if not isinstance(core_sig, CoreSignature):
         raise TypeError(
-            f"Expected amaranth.lib.stream.Signature, got {type(core_sig).__name__}")
+            f"Expected amaranth.lib.stream.Signature, got {type(core_sig).__name__}"
+        )
     return Signature(
         core_sig._payload_shape,
         always_valid=core_sig.always_valid,
@@ -233,17 +251,24 @@ def core_to_extended(core_sig):
     )
 
 
-def connect_streams(m, src, dst, *, exclude=None):
-    """Connect two stream interfaces combinationally.
+def connect_streams(src, dst, *, exclude=None):
+    """Return a list of statements connecting two stream interfaces.
 
     Wires ``src`` (source / initiator) to ``dst`` (destination / target),
     connecting handshake signals, payload, and any optional members that
     both interfaces share.
 
+    Returns a list of :class:`~amaranth.hdl.ast.Assign` statements that
+    can be added to any domain or used inside control flow::
+
+        m.d.comb += connect_streams(source, sink)
+        m.d.sync += connect_streams(source, sink)
+
+        with m.If(condition):
+            m.d.comb += connect_streams(source, sink)
+
     Parameters
     ----------
-    m : :class:`~amaranth.hdl.Module`
-        The module to add combinational statements to.
     src : stream interface
         Source stream (drives ``payload``, ``valid``, and forward sideband
         signals).
@@ -252,6 +277,11 @@ def connect_streams(m, src, dst, *, exclude=None):
     exclude : set of str or None
         Optional set of member names to skip when connecting.  For example,
         ``exclude={"param"}`` will leave the ``param`` member unconnected.
+
+    Returns
+    -------
+    list of :class:`~amaranth.hdl.ast.Assign`
+        Statements wiring ``src`` to ``dst``.
 
     Notes
     -----
@@ -263,6 +293,8 @@ def connect_streams(m, src, dst, *, exclude=None):
     if exclude is None:
         exclude = set()
 
+    stmts = []
+
     # Determine which members exist on each side by inspecting the
     # underlying Signature.  We accept both Interface objects (which
     # have a .signature attribute) and FlippedInterface / plain objects
@@ -273,6 +305,7 @@ def connect_streams(m, src, dst, *, exclude=None):
             return None
         # Unwrap FlippedSignature if needed
         from amaranth.lib.wiring import FlippedSignature
+
         if isinstance(sig, FlippedSignature):
             return sig.flip()
         return sig
@@ -282,13 +315,13 @@ def connect_streams(m, src, dst, *, exclude=None):
 
     # --- Handshake (always connected) ---
     if "valid" not in exclude:
-        m.d.comb += dst.valid.eq(src.valid)
+        stmts.append(dst.valid.eq(src.valid))
     if "ready" not in exclude:
-        m.d.comb += src.ready.eq(dst.ready)
+        stmts.append(src.ready.eq(dst.ready))
 
     # --- Payload ---
     if "payload" not in exclude:
-        m.d.comb += dst.payload.eq(src.payload)
+        stmts.append(dst.payload.eq(src.payload))
 
     # --- Optional forward members ---
     optional_members = ("first", "last", "param", "keep")
@@ -298,4 +331,6 @@ def connect_streams(m, src, dst, *, exclude=None):
         src_has = hasattr(src, name) and (src_sig is None or name in src_sig.members)
         dst_has = hasattr(dst, name) and (dst_sig is None or name in dst_sig.members)
         if src_has and dst_has:
-            m.d.comb += getattr(dst, name).eq(getattr(src, name))
+            stmts.append(getattr(dst, name).eq(getattr(src, name)))
+
+    return stmts

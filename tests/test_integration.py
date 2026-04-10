@@ -29,6 +29,7 @@ from amaranth_stream.packet import LastInserter, PacketFIFO
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _run_sim(dut, *testbenches, deadline_ns=200_000, vcd_name="test_integration.vcd"):
     """Helper to run a simulation with one or more testbenches."""
     sim = Simulator(dut)
@@ -39,27 +40,27 @@ def _run_sim(dut, *testbenches, deadline_ns=200_000, vcd_name="test_integration.
         sim.run_until(Period(ns=deadline_ns))
 
 
-def _connect_streams(m, src, dst):
-    """Connect two stream interfaces combinationally (src → dst)."""
-    m.d.comb += [
+def _connect_streams(src, dst):
+    """Return a list of statements connecting two stream interfaces (src → dst)."""
+    stmts = [
         dst.payload.eq(src.payload),
         dst.valid.eq(src.valid),
         src.ready.eq(dst.ready),
     ]
     if hasattr(src, "first") and hasattr(dst, "first"):
-        m.d.comb += [
-            dst.first.eq(src.first),
-            dst.last.eq(src.last),
-        ]
+        stmts.append(dst.first.eq(src.first))
+        stmts.append(dst.last.eq(src.last))
     if hasattr(src, "param") and hasattr(dst, "param"):
-        m.d.comb += dst.param.eq(src.param)
+        stmts.append(dst.param.eq(src.param))
     if hasattr(src, "keep") and hasattr(dst, "keep"):
-        m.d.comb += dst.keep.eq(src.keep)
+        stmts.append(dst.keep.eq(src.keep))
+    return stmts
 
 
 # ===========================================================================
 # Test 1: Width converter roundtrip (8b → 32b → 8b)
 # ===========================================================================
+
 
 class TestWidthConverterRoundtrip:
     """8b→32b→8b converter roundtrip. Send 8 bytes, upsize to 32b,
@@ -87,14 +88,20 @@ class TestWidthConverterRoundtrip:
                 beat = await receiver.recv(ctx)
                 results.append(beat["payload"])
 
-        _run_sim(dut, sender_tb, receiver_tb,
-                 deadline_ns=300_000, vcd_name="test_integ_width_roundtrip.vcd")
+        _run_sim(
+            dut,
+            sender_tb,
+            receiver_tb,
+            deadline_ns=300_000,
+            vcd_name="test_integ_width_roundtrip.vcd",
+        )
         assert results == expected, f"Expected {expected}, got {results}"
 
 
 # ===========================================================================
 # Test 2: Pipeline with FIFO and buffer
 # ===========================================================================
+
 
 class TestPipelineWithFifoAndBuffer:
     """Pipeline(PipeValid, StreamFIFO, PipeReady). Send data through,
@@ -122,14 +129,20 @@ class TestPipelineWithFifoAndBuffer:
                 beat = await receiver.recv(ctx)
                 results.append(beat["payload"])
 
-        _run_sim(dut, sender_tb, receiver_tb,
-                 deadline_ns=300_000, vcd_name="test_integ_pipeline_fifo_buf.vcd")
+        _run_sim(
+            dut,
+            sender_tb,
+            receiver_tb,
+            deadline_ns=300_000,
+            vcd_name="test_integ_pipeline_fifo_buf.vcd",
+        )
         assert results == expected, f"Expected {expected}, got {results}"
 
 
 # ===========================================================================
 # Test 3: Mux/Arbiter pipeline
 # ===========================================================================
+
 
 class TestMuxArbiterPipeline:
     """Two sources → StreamArbiter → StreamFIFO → output.
@@ -144,11 +157,13 @@ class TestMuxArbiterPipeline:
             def __init__(self):
                 self._arbiter = StreamArbiter(sig, n=2, round_robin=True)
                 self._fifo = StreamFIFO(sig, depth=16)
-                super().__init__({
-                    "i_stream__0": In(sig),
-                    "i_stream__1": In(sig),
-                    "o_stream": Out(sig),
-                })
+                super().__init__(
+                    {
+                        "i_stream__0": In(sig),
+                        "i_stream__1": In(sig),
+                        "o_stream": Out(sig),
+                    }
+                )
 
             def elaborate(self, platform):
                 m = Module()
@@ -156,18 +171,22 @@ class TestMuxArbiterPipeline:
                 m.submodules.fifo = self._fifo
 
                 # Inputs → Arbiter
-                _connect_streams(m, wiring.flipped(self.i_stream__0),
-                                 self._arbiter.i_stream__0)
-                _connect_streams(m, wiring.flipped(self.i_stream__1),
-                                 self._arbiter.i_stream__1)
+                m.d.comb += _connect_streams(
+                    wiring.flipped(self.i_stream__0), self._arbiter.i_stream__0
+                )
+                m.d.comb += _connect_streams(
+                    wiring.flipped(self.i_stream__1), self._arbiter.i_stream__1
+                )
 
                 # Arbiter → FIFO
-                _connect_streams(m, self._arbiter.o_stream,
-                                 self._fifo.i_stream)
+                m.d.comb += _connect_streams(
+                    self._arbiter.o_stream, self._fifo.i_stream
+                )
 
                 # FIFO → Output
-                _connect_streams(m, self._fifo.o_stream,
-                                 wiring.flipped(self.o_stream))
+                m.d.comb += _connect_streams(
+                    self._fifo.o_stream, wiring.flipped(self.o_stream)
+                )
 
                 return m
 
@@ -193,17 +212,25 @@ class TestMuxArbiterPipeline:
                 beat = await receiver.recv(ctx)
                 results.append(beat["payload"])
 
-        _run_sim(dut, sender0_tb, sender1_tb, receiver_tb,
-                 deadline_ns=500_000, vcd_name="test_integ_arbiter_pipeline.vcd")
+        _run_sim(
+            dut,
+            sender0_tb,
+            sender1_tb,
+            receiver_tb,
+            deadline_ns=500_000,
+            vcd_name="test_integ_arbiter_pipeline.vcd",
+        )
 
         # All 6 values should arrive (order depends on arbitration)
-        assert sorted(results) == sorted(src0_data + src1_data), \
+        assert sorted(results) == sorted(src0_data + src1_data), (
             f"Expected all values {sorted(src0_data + src1_data)}, got {sorted(results)}"
+        )
 
 
 # ===========================================================================
 # Test 4: Splitter → FIFOs → Joiner roundtrip
 # ===========================================================================
+
 
 class TestSplitterJoinerRoundtrip:
     """StreamSplitter(n=2) → two StreamFIFOs → StreamJoiner(n=2).
@@ -218,10 +245,12 @@ class TestSplitterJoinerRoundtrip:
                 self._fifo0 = StreamFIFO(sig, depth=8)
                 self._fifo1 = StreamFIFO(sig, depth=8)
                 self._joiner = StreamJoiner(sig, n=2)
-                super().__init__({
-                    "i_stream": In(sig),
-                    "o_stream": Out(sig),
-                })
+                super().__init__(
+                    {
+                        "i_stream": In(sig),
+                        "o_stream": Out(sig),
+                    }
+                )
 
             def elaborate(self, platform):
                 m = Module()
@@ -231,28 +260,34 @@ class TestSplitterJoinerRoundtrip:
                 m.submodules.joiner = self._joiner
 
                 # Input → Splitter
-                _connect_streams(m, wiring.flipped(self.i_stream),
-                                 self._splitter.i_stream)
+                m.d.comb += _connect_streams(
+                    wiring.flipped(self.i_stream), self._splitter.i_stream
+                )
 
                 # Splitter output 0 → FIFO 0
-                _connect_streams(m, self._splitter.o_stream__0,
-                                 self._fifo0.i_stream)
+                m.d.comb += _connect_streams(
+                    self._splitter.o_stream__0, self._fifo0.i_stream
+                )
 
                 # Splitter output 1 → FIFO 1
-                _connect_streams(m, self._splitter.o_stream__1,
-                                 self._fifo1.i_stream)
+                m.d.comb += _connect_streams(
+                    self._splitter.o_stream__1, self._fifo1.i_stream
+                )
 
                 # FIFO 0 → Joiner input 0
-                _connect_streams(m, self._fifo0.o_stream,
-                                 self._joiner.i_stream__0)
+                m.d.comb += _connect_streams(
+                    self._fifo0.o_stream, self._joiner.i_stream__0
+                )
 
                 # FIFO 1 → Joiner input 1
-                _connect_streams(m, self._fifo1.o_stream,
-                                 self._joiner.i_stream__1)
+                m.d.comb += _connect_streams(
+                    self._fifo1.o_stream, self._joiner.i_stream__1
+                )
 
                 # Joiner → Output
-                _connect_streams(m, self._joiner.o_stream,
-                                 wiring.flipped(self.o_stream))
+                m.d.comb += _connect_streams(
+                    self._joiner.o_stream, wiring.flipped(self.o_stream)
+                )
 
                 return m
 
@@ -273,18 +308,25 @@ class TestSplitterJoinerRoundtrip:
                 beat = await receiver.recv(ctx)
                 results.append(beat["payload"])
 
-        _run_sim(dut, sender_tb, receiver_tb,
-                 deadline_ns=500_000, vcd_name="test_integ_split_join.vcd")
+        _run_sim(
+            dut,
+            sender_tb,
+            receiver_tb,
+            deadline_ns=500_000,
+            vcd_name="test_integ_split_join.vcd",
+        )
 
         # Each value should appear exactly twice (once from each FIFO)
         for val in expected:
-            assert results.count(val) == 2, \
+            assert results.count(val) == 2, (
                 f"Expected value {val:#x} to appear 2 times, got {results.count(val)}"
+            )
 
 
 # ===========================================================================
 # Test 5: Filter then Pack
 # ===========================================================================
+
 
 class TestFilterThenPack:
     """StreamFilter (pass even) → Pack(n=4). Filter stream, then pack
@@ -315,8 +357,13 @@ class TestFilterThenPack:
                 beat = await receiver.recv(ctx)
                 results.append(beat["payload"])
 
-        _run_sim(dut, sender_tb, receiver_tb,
-                 deadline_ns=500_000, vcd_name="test_integ_filter_pack.vcd")
+        _run_sim(
+            dut,
+            sender_tb,
+            receiver_tb,
+            deadline_ns=500_000,
+            vcd_name="test_integ_filter_pack.vcd",
+        )
 
         # First packed beat: [0, 2, 4, 6] = 0x06040200
         # Second packed beat: [8, 10, 12, 14] = 0x0E0C0A08
@@ -332,6 +379,7 @@ class TestFilterThenPack:
 # Test 6: EndianSwap roundtrip
 # ===========================================================================
 
+
 class TestEndianSwapRoundtrip:
     """EndianSwap → EndianSwap. Double swap should be identity."""
 
@@ -345,10 +393,12 @@ class TestEndianSwapRoundtrip:
             def __init__(self):
                 self._swap1 = EndianSwap(sig)
                 self._swap2 = EndianSwap(sig)
-                super().__init__({
-                    "i_stream": In(sig),
-                    "o_stream": Out(sig),
-                })
+                super().__init__(
+                    {
+                        "i_stream": In(sig),
+                        "o_stream": Out(sig),
+                    }
+                )
 
             def elaborate(self, platform):
                 m = Module()
@@ -357,16 +407,17 @@ class TestEndianSwapRoundtrip:
                 m.submodules.swap2 = self._swap2
 
                 # Input → Swap1
-                _connect_streams(m, wiring.flipped(self.i_stream),
-                                 self._swap1.i_stream)
+                m.d.comb += _connect_streams(
+                    wiring.flipped(self.i_stream), self._swap1.i_stream
+                )
 
                 # Swap1 → Swap2
-                _connect_streams(m, self._swap1.o_stream,
-                                 self._swap2.i_stream)
+                m.d.comb += _connect_streams(self._swap1.o_stream, self._swap2.i_stream)
 
                 # Swap2 → Output
-                _connect_streams(m, self._swap2.o_stream,
-                                 wiring.flipped(self.o_stream))
+                m.d.comb += _connect_streams(
+                    self._swap2.o_stream, wiring.flipped(self.o_stream)
+                )
 
                 return m
 
@@ -385,14 +436,20 @@ class TestEndianSwapRoundtrip:
                 beat = await receiver.recv(ctx)
                 results.append(beat["payload"])
 
-        _run_sim(dut, sender_tb, receiver_tb,
-                 deadline_ns=200_000, vcd_name="test_integ_endian_roundtrip.vcd")
+        _run_sim(
+            dut,
+            sender_tb,
+            receiver_tb,
+            deadline_ns=200_000,
+            vcd_name="test_integ_endian_roundtrip.vcd",
+        )
         assert results == expected, f"Expected {expected}, got {results}"
 
 
 # ===========================================================================
 # Test 7: Monitor in pipeline
 # ===========================================================================
+
 
 class TestMonitorInPipeline:
     """StreamMonitor in a pipeline. Verify counters while data flows."""
@@ -423,16 +480,23 @@ class TestMonitorInPipeline:
             _, _, tc = await ctx.tick().sample(monitor.transfer_count)
             transfer_count_final[0] = tc
 
-        _run_sim(dut, sender_tb, receiver_tb,
-                 deadline_ns=300_000, vcd_name="test_integ_monitor_pipeline.vcd")
+        _run_sim(
+            dut,
+            sender_tb,
+            receiver_tb,
+            deadline_ns=300_000,
+            vcd_name="test_integ_monitor_pipeline.vcd",
+        )
         assert results == expected, f"Expected {expected}, got {results}"
-        assert transfer_count_final[0] == len(expected), \
+        assert transfer_count_final[0] == len(expected), (
             f"Expected transfer_count={len(expected)}, got {transfer_count_final[0]}"
+        )
 
 
 # ===========================================================================
 # Test 8: Full packet pipeline (LastInserter → PacketFIFO → output)
 # ===========================================================================
+
 
 class TestFullPacketPipeline:
     """LastInserter → PacketFIFO → output. Create fixed-size packets,
@@ -460,8 +524,13 @@ class TestFullPacketPipeline:
                 beat = await receiver.recv(ctx)
                 results.append(beat)
 
-        _run_sim(dut, sender_tb, receiver_tb,
-                 deadline_ns=500_000, vcd_name="test_integ_packet_pipeline.vcd")
+        _run_sim(
+            dut,
+            sender_tb,
+            receiver_tb,
+            deadline_ns=500_000,
+            vcd_name="test_integ_packet_pipeline.vcd",
+        )
 
         # Verify all payloads arrived
         payloads = [b["payload"] for b in results]
@@ -471,15 +540,18 @@ class TestFullPacketPipeline:
         for i, beat in enumerate(results):
             expected_first = 1 if (i % 4 == 0) else 0
             expected_last = 1 if (i % 4 == 3) else 0
-            assert beat["first"] == expected_first, \
+            assert beat["first"] == expected_first, (
                 f"Beat {i}: expected first={expected_first}, got {beat['first']}"
-            assert beat["last"] == expected_last, \
+            )
+            assert beat["last"] == expected_last, (
                 f"Beat {i}: expected last={expected_last}, got {beat['last']}"
+            )
 
 
 # ===========================================================================
 # Test 9: Stress multi-component pipeline
 # ===========================================================================
+
 
 class TestStressMultiComponent:
     """Complex pipeline with random valid/ready:
@@ -508,7 +580,13 @@ class TestStressMultiComponent:
                 beat = await receiver.recv(ctx)
                 results.append(beat["payload"])
 
-        _run_sim(dut, sender_tb, receiver_tb,
-                 deadline_ns=2_000_000, vcd_name="test_integ_stress.vcd")
-        assert results == expected, \
+        _run_sim(
+            dut,
+            sender_tb,
+            receiver_tb,
+            deadline_ns=2_000_000,
+            vcd_name="test_integ_stress.vcd",
+        )
+        assert results == expected, (
             f"Mismatch at {len(results)} results vs {len(expected)} expected"
+        )

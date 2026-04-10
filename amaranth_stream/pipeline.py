@@ -38,20 +38,20 @@ def _unwrap_signature(sig):
     return sig
 
 
-def _connect_streams(m, src, dst, sig):
-    """Connect two stream interfaces combinationally.
+def _connect_streams(src, dst, sig):
+    """Return a list of statements connecting two stream interfaces.
 
     src is the output side (drives payload, valid, etc.)
     dst is the input side (drives ready)
     sig is the StreamSignature.
     """
+    stmts = []
     fwd_names = _get_forward_signals(sig)
     for name in fwd_names:
-        m.d.comb += getattr(dst, name).eq(getattr(src, name))
-    m.d.comb += [
-        dst.valid.eq(src.valid),
-        src.ready.eq(dst.ready),
-    ]
+        stmts.append(getattr(dst, name).eq(getattr(src, name)))
+    stmts.append(dst.valid.eq(src.valid))
+    stmts.append(src.ready.eq(dst.ready))
+    return stmts
 
 
 class Pipeline(wiring.Component):
@@ -80,10 +80,12 @@ class Pipeline(wiring.Component):
         first_sig = self._get_stream_sig(stages[0], "i_stream")
         last_sig = self._get_stream_sig(stages[-1], "o_stream")
 
-        super().__init__({
-            "i_stream": In(first_sig),
-            "o_stream": Out(last_sig),
-        })
+        super().__init__(
+            {
+                "i_stream": In(first_sig),
+                "o_stream": Out(last_sig),
+            }
+        )
 
     @staticmethod
     def _get_stream_sig(stage, port_name):
@@ -93,13 +95,13 @@ class Pipeline(wiring.Component):
         """
         port = getattr(stage, port_name, None)
         if port is None:
-            raise ValueError(
-                f"Stage {stage!r} does not have a '{port_name}' port")
+            raise ValueError(f"Stage {stage!r} does not have a '{port_name}' port")
         sig = _unwrap_signature(port.signature)
         if not isinstance(sig, StreamSignature):
             raise TypeError(
                 f"Stage {stage!r}.{port_name} signature is not a "
-                f"StreamSignature, got {type(sig).__name__}")
+                f"StreamSignature, got {type(sig).__name__}"
+            )
         return sig
 
     def elaborate(self, platform):
@@ -114,18 +116,22 @@ class Pipeline(wiring.Component):
 
         # Connect pipeline input to first stage
         first_sig = self._get_stream_sig(first, "i_stream")
-        _connect_streams(m, wiring.flipped(self.i_stream), first.i_stream, first_sig)
+        m.d.comb += _connect_streams(
+            wiring.flipped(self.i_stream), first.i_stream, first_sig
+        )
 
         # Chain intermediate stages
         for i in range(len(self._stages) - 1):
             src_stage = self._stages[i]
             dst_stage = self._stages[i + 1]
             sig = self._get_stream_sig(src_stage, "o_stream")
-            _connect_streams(m, src_stage.o_stream, dst_stage.i_stream, sig)
+            m.d.comb += _connect_streams(src_stage.o_stream, dst_stage.i_stream, sig)
 
         # Connect last stage to pipeline output
         last_sig = self._get_stream_sig(last, "o_stream")
-        _connect_streams(m, last.o_stream, wiring.flipped(self.o_stream), last_sig)
+        m.d.comb += _connect_streams(
+            last.o_stream, wiring.flipped(self.o_stream), last_sig
+        )
 
         return m
 
@@ -156,7 +162,7 @@ class BufferizeEndpoints(wiring.Component):
         self._pipe_ready = bool(pipe_ready)
 
         # Discover stream ports on the wrapped component
-        self._in_streams = {}   # name -> StreamSignature
+        self._in_streams = {}  # name -> StreamSignature
         self._out_streams = {}  # name -> StreamSignature
 
         for name, member in component.signature.members.items():
@@ -195,11 +201,11 @@ class BufferizeEndpoints(wiring.Component):
             # flipped: payload=In, valid=In, ready=Out — acts as source
             # buf.i_stream is external view (FlippedInterface): payload=In, valid=In, ready=Out
             # We need source -> sink, so flipped(our_port) drives buf.i_stream
-            _connect_streams(m, wiring.flipped(our_port), buf.i_stream, sig)
+            m.d.comb += _connect_streams(wiring.flipped(our_port), buf.i_stream, sig)
 
             # buf.o_stream is external view: payload=Out, valid=Out, ready=In — acts as source
             # comp_port is external view (FlippedInterface): payload=In, valid=In, ready=Out — acts as sink
-            _connect_streams(m, buf.o_stream, comp_port, sig)
+            m.d.comb += _connect_streams(buf.o_stream, comp_port, sig)
 
         # For each Out stream port: add a buffer after the component
         for name, sig in self._out_streams.items():
@@ -209,12 +215,12 @@ class BufferizeEndpoints(wiring.Component):
             # comp_port is external view: payload=Out, valid=Out, ready=In — acts as source
             # buf.i_stream is external view (FlippedInterface): payload=In, valid=In, ready=Out — acts as sink
             comp_port = getattr(self._component, name)
-            _connect_streams(m, comp_port, buf.i_stream, sig)
+            m.d.comb += _connect_streams(comp_port, buf.i_stream, sig)
 
             # buf.o_stream is external view: payload=Out, valid=Out, ready=In — acts as source
             # our_port (self.o_stream) is internal view: payload=Out, valid=Out, ready=In
             # flipped: payload=In, valid=In, ready=Out — acts as sink
             our_port = getattr(self, name)
-            _connect_streams(m, buf.o_stream, wiring.flipped(our_port), sig)
+            m.d.comb += _connect_streams(buf.o_stream, wiring.flipped(our_port), sig)
 
         return m

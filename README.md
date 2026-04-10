@@ -486,36 +486,49 @@ ext_sig = core_to_extended(core_sig)
 #### connect_streams
 
 ```python
-def connect_streams(m, src, dst, *, exclude=None)
+def connect_streams(src, dst, *, exclude=None) -> list[Assign]
 ```
 
-Connect two stream interfaces combinationally. Wires `src` (source/initiator) to `dst` (destination/target), connecting handshake signals, payload, and any optional members that both interfaces share.
+Return a list of statements that wire `src` (source/initiator) to `dst` (destination/target), connecting handshake signals, payload, and any optional members that both interfaces share.
+
+Because `connect_streams` returns a statement list rather than modifying a module directly, the caller controls which clock domain or control block the connections are placed in.
 
 **Parameters:**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `m` | `Module` | *(required)* | The module to add combinational statements to |
 | `src` | stream interface | *(required)* | Source stream (drives payload, valid, and forward sideband signals) |
 | `dst` | stream interface | *(required)* | Destination stream (drives ready) |
 | `exclude` | `set` of `str` or `None` | `None` | Optional set of member names to skip when connecting |
+
+**Returns:** `list[Assign]` — Statements wiring `src` to `dst`.
 
 **Behavior:** Only members present on **both** `src` and `dst` are connected. If one side has `first`/`last` but the other does not, those signals are silently skipped. The `exclude` parameter can suppress connection of any member by name.
 
 **Example:**
 
 ```python
+from amaranth import Module
+from amaranth.hdl import Signal
 from amaranth_stream import Signature, connect_streams
 
 sig = Signature(32, has_first_last=True)
 src = sig.create()
 dst = sig.create()
 
-# In elaborate():
-connect_streams(m, src, dst)
+# Combinational connection (most common):
+m.d.comb += connect_streams(src, dst)
+
+# Registered connection:
+m.d.sync += connect_streams(src, dst)
+
+# Conditional connection:
+enable = Signal()
+with m.If(enable):
+    m.d.comb += connect_streams(src, dst)
 
 # Skip param connection:
-connect_streams(m, src, dst, exclude={"param"})
+m.d.comb += connect_streams(src, dst, exclude={"param"})
 ```
 
 ---
@@ -3239,7 +3252,7 @@ from amaranth_stream import Signature, Buffer, StreamFIFO, Pipeline
 | 1 | `Signature` | `_base` | Core | Extended stream signature with optional first/last, param, keep |
 | 2 | `Interface` | `_base` | Core | Concrete stream interface from a Signature |
 | 3 | `core_to_extended` | `_base` | Core | Convert core Amaranth stream signature to extended |
-| 4 | `connect_streams` | `_base` | Core | Connect two stream interfaces combinationally |
+| 4 | `connect_streams` | `_base` | Core | Return statements connecting two stream interfaces |
 | 5 | `StreamSimSender` | `sim` | Sim BFM | Testbench BFM: drives stream source |
 | 6 | `StreamSimReceiver` | `sim` | Sim BFM | Testbench BFM: consumes stream sink |
 | 7 | `Buffer` | `buffer` | Buffering | Pipeline register (configurable forward/backward) |
